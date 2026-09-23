@@ -71,23 +71,21 @@ def _prefill_cp_token_allgather_step(
     target_row = tp_rank * local_t
 
     # Publish the payload and first-phase arrival from one producer task.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_push", allow_early_resolve=True,
-    ) as _push_tid:
-        for peer_tp in pl.range(TP_SIZE):
-            pld.tensor.put(
-                dst=gather_window, peer=group_base + peer_tp,
-                src=hidden_local,
-                dst_offsets=[target_row, 0], src_offsets=[0, 0], shape=[local_t, D],
-                chunk_rows=COMM_ROW_TILE, chunk_cols=D,
-                pipeline=True,
+    with pl.spmd(TP_SIZE, name_hint="prefill_cp_token_allgather_push", allow_early_resolve=True) as _push_tid:
+        peer_tp = pl.tile.get_block_idx()
+        peer = group_base + pl.cast(peer_tp, pl.INT32)
+        pld.tensor.put(
+            dst=gather_window, peer=peer,
+            src=hidden_local,
+            dst_offsets=[target_row, 0], src_offsets=[0, 0], shape=[local_t, D],
+            chunk_rows=COMM_ROW_TILE, chunk_cols=D,
+            pipeline=True,
+        )
+        if peer_tp != tp_rank:
+            pld.system.notify(
+                target=gather_signal, peer=peer,
+                offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
             )
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-                )
 
     # Register the peer payload conditions as deferred completion.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_payload_wait") as _payload_wait_tid:

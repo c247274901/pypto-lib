@@ -243,42 +243,39 @@ def _prefill_compressor_ratio128_tile(
                     value=0.0,
                 )
                 pool_abs = pool_start + pool_state_i
-                pool_state_block = pl.cast(pool_abs // HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                pool_state_intra = pl.cast(pool_abs - pool_state_block * HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                pool_phys_block_raw = pl.read(compress_state_block_table, [pool_state_block])
-                if pool_phys_block_raw >= 0:
-                    pool_phys_block = pl.cast(pool_phys_block_raw, pl.INDEX)
-                    pool_state_row = pool_phys_block * HCA_STATE_BLOCK_SIZE + pool_state_intra
-                    pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
-                        pool_state_row : pool_state_row + 1,
-                        h0 : h0 + HEAD_TILE,
-                    ]
-                    pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
-                        pool_state_row : pool_state_row + 1,
-                        OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE,
-                    ]
-
-                # Current-tile rows come from projection scratch. Persistent
-                # state remains the source only for history before this tile.
                 pool_source = write_src - pl.cast(write_pos - pool_abs, pl.INDEX)
-                if pool_source >= tile_base:
-                    if pool_source < tile_end:
-                        pool_local = pool_source - tile_base
-                        pool_ape_slot = pl.cast(pool_abs % COMPRESS_RATIO, pl.INDEX)
-                        pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = kv_proj_scratch[
-                            pool_local : pool_local + 1,
+                if pool_source < tile_base or pool_source >= tile_end:
+                    pool_state_block = pl.cast(pool_abs // HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                    pool_state_intra = pl.cast(pool_abs - pool_state_block * HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                    pool_phys_block_raw = pl.read(compress_state_block_table, [pool_state_block])
+                    if pool_phys_block_raw >= 0:
+                        pool_phys_block = pl.cast(pool_phys_block_raw, pl.INDEX)
+                        pool_state_row = pool_phys_block * HCA_STATE_BLOCK_SIZE + pool_state_intra
+                        pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
+                            pool_state_row : pool_state_row + 1,
                             h0 : h0 + HEAD_TILE,
                         ]
-                        pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.add(
-                            score_proj_scratch[
-                                pool_local : pool_local + 1,
-                                h0 : h0 + HEAD_TILE,
-                            ],
-                            ape[
-                                pool_ape_slot : pool_ape_slot + 1,
-                                h0 : h0 + HEAD_TILE,
-                            ],
-                        )
+                        pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
+                            pool_state_row : pool_state_row + 1,
+                            OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE,
+                        ]
+                else:
+                    pool_local = pool_source - tile_base
+                    pool_ape_slot = pl.cast(pool_abs % COMPRESS_RATIO, pl.INDEX)
+                    pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = kv_proj_scratch[
+                        pool_local : pool_local + 1,
+                        h0 : h0 + HEAD_TILE,
+                    ]
+                    pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.add(
+                        score_proj_scratch[
+                            pool_local : pool_local + 1,
+                            h0 : h0 + HEAD_TILE,
+                        ],
+                        ape[
+                            pool_ape_slot : pool_ape_slot + 1,
+                            h0 : h0 + HEAD_TILE,
+                        ],
+                    )
             # Vectorized softmax over all STATE_LEN slots: transpose the assembled
             # [STATE_LEN, HEAD_TILE] tile, then row_max/exp/sum/div and the weighted sum.
             pool_score_t = pl.transpose(pool_score_tile, axis1=0, axis2=1)
