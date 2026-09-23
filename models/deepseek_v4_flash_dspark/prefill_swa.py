@@ -95,6 +95,7 @@ BLOCK_TABLE_BLOCKS = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 SPARSE_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // 128 + BLOCK_SIZE - 1) // BLOCK_SIZE
 START_POS = 0
+KV_CACHE_WRITE_WORKERS = 32
 
 
 def _prefill_attention_swa(
@@ -268,39 +269,42 @@ def prefill_attention_swa_cp_core(
 
     block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [block_num * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cp_cache_write"):
+    for write_worker in pl.spmd(KV_CACHE_WRITE_WORKERS, name_hint="prefill_swa_cp_cache_write"):
         for write_t in pl.range(kv_dim):
             write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
             if write_row_raw >= 0:
                 write_row = pl.cast(write_row_raw, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
+                if write_row % KV_CACHE_WRITE_WORKERS == write_worker:
+                    kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
 
     swa_indices = pl.create_tensor([q_dim, WIN], dtype=pl.INT32)
     valid_block_mask = pl.create_tensor([q_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cp_window_indices"):
-        for idx_t in pl.range(q_dim):
-            idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-            request_id = pl.read(local_request_ids, [idx_t])
-            if request_id >= 0:
-                abs_pos = pl.read(position_ids_local, [idx_t])
-                window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-                key_start_abs = abs_pos + 1 - window_valid
-                for win_col in pl.range(WIN):
-                    win_col_i32 = pl.cast(win_col, pl.INT32)
-                    if win_col_i32 < window_valid:
-                        key_abs = key_start_abs + win_col_i32
-                        blk_slot = key_abs // BLOCK_SIZE
-                        blk = pl.read(block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
-                        if blk >= 0:
-                            block_row = key_abs - blk_slot * BLOCK_SIZE
-                            row = pl.cast(blk * BLOCK_SIZE + block_row, pl.INT32)
-                            pl.write(idx_row, [0, win_col], row)
-                            if win_col < SPARSE_BIAS_COLS:
-                                block_col = win_col // PREFILL_ATTN_TILE
-                                pl.write(mask_row, [0, block_col], pl.cast(1, pl.INT32))
-            swa_indices[idx_t : idx_t + 1, 0:WIN] = idx_row
-            valid_block_mask[idx_t : idx_t + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
+    for idx_block in pl.spmd((q_dim + 3) // 4, name_hint="prefill_swa_cp_window_indices"):
+        for idx_offset in pl.range(4):
+            idx_t = idx_block * 4 + idx_offset
+            if idx_t < q_dim:
+                idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+                mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
+                request_id = pl.read(local_request_ids, [idx_t])
+                if request_id >= 0:
+                    abs_pos = pl.read(position_ids_local, [idx_t])
+                    window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                    key_start_abs = abs_pos + 1 - window_valid
+                    for win_col in pl.range(WIN):
+                        win_col_i32 = pl.cast(win_col, pl.INT32)
+                        if win_col_i32 < window_valid:
+                            key_abs = key_start_abs + win_col_i32
+                            blk_slot = key_abs // BLOCK_SIZE
+                            blk = pl.read(block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
+                            if blk >= 0:
+                                block_row = key_abs - blk_slot * BLOCK_SIZE
+                                row = pl.cast(blk * BLOCK_SIZE + block_row, pl.INT32)
+                                pl.write(idx_row, [0, win_col], row)
+                                if win_col < SPARSE_BIAS_COLS:
+                                    block_col = win_col // PREFILL_ATTN_TILE
+                                    pl.write(mask_row, [0, block_col], pl.cast(1, pl.INT32))
+                swa_indices[idx_t : idx_t + 1, 0:WIN] = idx_row
+                valid_block_mask[idx_t : idx_t + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
     request_count = pl.tensor.dim(block_table, 0)
     cmp_block_table_dummy = pl.create_tensor([request_count, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
