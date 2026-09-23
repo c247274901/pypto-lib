@@ -97,7 +97,7 @@ ROPE_CS_T_TILE = 8  # rope cos/sin row block
 # proj_a / proj_b cube M. Bounded by the 128 KiB L0C Acc (ROW_TILE*N_TILE*4) and by
 # T_PAD: a taller row tile reads into the next group's slab and writes past the end
 # of the row-indexed scratch.
-PROJ_A_ROW_TILE = min(256, T_PAD)
+PROJ_A_ROW_TILE = min(128, T_PAD)
 PROJ_B_ROW_TILE = min(128, T_PAD)
 # Task-array fan-outs; named because a deps= list comprehension cannot be hoisted
 # out of the call (the tracer rejects a bare ListComp statement).
@@ -1102,10 +1102,9 @@ def _sparse_attn_o_proj(
     proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS, pl.TASK_ID)
-    # Keep arbitrary physical tails out of the Cube/quantization chain.  The packed-head
-    # buffer is zero-initialized, so rounding the internal O extent to a complete 512-row
-    # quant tile is mathematically neutral; only the final store is cropped to tile_rows.
-    o_compute_rows = ((tile_rows + O_PROJ_PAD_ROWS - 1) // O_PROJ_PAD_ROWS) * O_PROJ_PAD_ROWS
+    # Round physical tails up to a complete proj_a tile; only the final store
+    # writes active rows.
+    o_compute_rows = ((tile_rows + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE) * PROJ_A_ROW_TILE
     proj_a_rows = o_compute_rows // PROJ_A_ROW_TILE
     quant_rows = o_compute_rows // QUANT_TOKEN_TILE
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
@@ -1324,8 +1323,13 @@ def sparse_attn_compute(
                 dtype=pl.BF16,
                 manual_dep=True,
             )
-            with pl.spmd(T_PAD * H // PREFILL_QUERY_TILE, name_hint="prefill_sparse_packed_init") as packed_init_tid:
-                packed_row = pl.tile.get_block_idx() * PREFILL_QUERY_TILE
+            packed_rows = ((tile_rows + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE) * PROJ_A_ROW_TILE
+            packed_group_blocks = packed_rows * HEADS_PER_GROUP // PREFILL_QUERY_TILE
+            with pl.spmd(O_GROUPS * packed_group_blocks, name_hint="prefill_sparse_packed_init") as packed_init_tid:
+                packed_block = pl.tile.get_block_idx()
+                packed_group = packed_block // packed_group_blocks
+                packed_row = packed_group * T_PAD * HEADS_PER_GROUP
+                packed_row = packed_row + (packed_block % packed_group_blocks) * PREFILL_QUERY_TILE
                 packed_zero = pl.full([PREFILL_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                 o_packed_heads[packed_row : packed_row + PREFILL_QUERY_TILE, 0:HEAD_DIM] = packed_zero
             o_packed_heads, heads_dep = _sparse_attn_heads(

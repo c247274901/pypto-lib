@@ -61,11 +61,11 @@ QR_OK = 2  # qr_proj split-K factor         | D//QR_OK cores share each N-group
 QR_SPLIT_K_TILE = D // QR_OK  # qr_proj K per split (=2048)
 KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real rows to 16
 KV_DENSE_M_TILE = 64
-KV_N_TILE = 128  # kv_proj HEAD_DIM (N) per matmul
+KV_N_TILE = 256  # kv_proj HEAD_DIM (N) per matmul
 KV_K_TILE = 256  # kv_proj D (K) reduction tile   | divides KV_SPLIT_K_TILE
-KV_OK = 2  # kv_proj split-K factor         | D//KV_OK cores share each N-group
+KV_OK = 4  # kv_proj split-K factor         | D//KV_OK cores share each N-group
 KV_OM = 3  # maximum kv_proj split-M factor
-KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=2048)
+KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=1024)
 QPROJ_M_TILE = 64  # dense qproj token tile; 64 KiB L0C accumulator
 # qproj_matmul runs on persistent workers, one per physical AIC.
 QPROJ_WORKERS = 24
