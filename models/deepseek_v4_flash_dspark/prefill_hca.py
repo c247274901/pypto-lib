@@ -91,6 +91,10 @@ HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 COMPRESS_RATIO = 128
+HCA_SWA_ROW_TILE = 8
+HCA_QUERY_SLICE_TILE = 8
+HCA_CACHE_READY_TILE = 64
+HCA_CACHE_WRITE_TILE = 64
 MAIN_OUT_DIM = HEAD_DIM
 MAIN_COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 START_POS = 0
@@ -851,12 +855,15 @@ def prefill_attention_hca_cp_core(
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     ori_cache_rows = ori_block_num * BLOCK_SIZE
     kv_cache_flat = pl.reshape(kv_cache, [ori_cache_rows, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_cp_cache_write") as ori_cache_write_tid:
-        for write_t in pl.range(kv_dim):
-            write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
-            if write_row_raw >= 0:
-                write_row = pl.cast(write_row_raw, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
+    with pl.spmd((kv_dim + HCA_CACHE_WRITE_TILE - 1) // HCA_CACHE_WRITE_TILE, name_hint="prefill_hca_cp_cache_write") as ori_cache_write_tid:
+        write_base = pl.tile.get_block_idx() * HCA_CACHE_WRITE_TILE
+        for write_offset in pl.range(HCA_CACHE_WRITE_TILE):
+            write_t = write_base + write_offset
+            if write_t < kv_dim:
+                write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
+                if write_row_raw >= 0:
+                    write_row = pl.cast(write_row_raw, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
 
     prefill_compressor_ratio128(
         x_normed_full,
@@ -869,24 +876,27 @@ def prefill_attention_hca_cp_core(
     )
 
     swa_indices = pl.create_tensor([q_dim, WIN], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_cp_swa_indices") as swa_indices_tid:
-        for idx_t in pl.range(q_dim):
-            swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            request_id = pl.read(local_request_ids, [idx_t])
-            if request_id >= 0:
-                abs_pos = pl.read(position_ids_local, [idx_t])
-                window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-                key_start_abs = abs_pos + 1 - window_valid
-                for win_col in pl.range(WIN):
-                    win_col_i32 = pl.cast(win_col, pl.INT32)
-                    if win_col_i32 < window_valid:
-                        key_abs = key_start_abs + win_col_i32
-                        blk_slot = key_abs // BLOCK_SIZE
-                        blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
-                        if blk >= 0:
-                            row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                            pl.write(swa_row, [0, win_col], row)
-            swa_indices[idx_t : idx_t + 1, 0:WIN] = swa_row
+    with pl.spmd((q_dim + HCA_SWA_ROW_TILE - 1) // HCA_SWA_ROW_TILE, name_hint="prefill_hca_cp_swa_indices") as swa_indices_tid:
+        row_base = pl.tile.get_block_idx() * HCA_SWA_ROW_TILE
+        for row_offset in pl.range(HCA_SWA_ROW_TILE):
+            idx_t = row_base + row_offset
+            if idx_t < q_dim:
+                swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+                request_id = pl.read(local_request_ids, [idx_t])
+                if request_id >= 0:
+                    abs_pos = pl.read(position_ids_local, [idx_t])
+                    window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                    key_start_abs = abs_pos + 1 - window_valid
+                    for win_col in pl.range(WIN):
+                        win_col_i32 = pl.cast(win_col, pl.INT32)
+                        if win_col_i32 < window_valid:
+                            key_abs = key_start_abs + win_col_i32
+                            blk_slot = key_abs // BLOCK_SIZE
+                            blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
+                            if blk >= 0:
+                                row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
+                                pl.write(swa_row, [0, win_col], row)
+                swa_indices[idx_t : idx_t + 1, 0:WIN] = swa_row
 
     # Streaming-attention input publication fence.
     cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * CMP_STORAGE_BLOCK_SIZE
@@ -894,33 +904,37 @@ def prefill_attention_hca_cp_core(
     cmp_cache_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     compress_state_flat = pl.reshape(compress_state, [state_rows, MAIN_COMPRESS_STATE_DIM])
     q_ready_flat = pl.reshape(q, [q_dim * H, HEAD_DIM])
-    cache_ready_fence = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="prefill_hca_cp_cache_ready",
+    cache_ready_blocks = (kv_dim + HCA_CACHE_READY_TILE - 1) // HCA_CACHE_READY_TILE
+    cache_ready_fence = pl.create_tensor([cache_ready_blocks], dtype=pl.INT32)
+    with pl.spmd(
+        cache_ready_blocks, name_hint="prefill_hca_cp_cache_ready",
         deps=[ori_cache_write_tid, swa_indices_tid],
     ) as cache_ready_dep:
+        ready_block = pl.tile.get_block_idx()
         ready_bit = pl.cast(1, pl.INT32)
-        for ready_t in pl.range(kv_dim):
-            if ready_t < q_dim:
-                q_ready_tile = pl.load(q_ready_flat, [ready_t * H, 0], [1, 16])
-                q_ready_bits = pl.reinterpret_view(q_ready_tile, pl.INT16)
-                q_ready_sample = pl.tile.read(q_ready_bits, [0, 0])
-                ready_bit = ready_bit + pl.cast(q_ready_sample, pl.INT32)
-            state_ready_row_raw = pl.read(state_slot_mapping_full, [ready_t])
-            if state_ready_row_raw >= 0:
-                state_ready_row = pl.cast(state_ready_row_raw, pl.INDEX)
-                state_ready_sample = pl.read(compress_state_flat, [state_ready_row, 0])
-                state_ready_bit = pl.cast(state_ready_sample == state_ready_sample, pl.INT32)
-                ready_bit = ready_bit * state_ready_bit
-            cmp_ready_row_raw = pl.read(cmp_slot_mapping_full, [ready_t])
-            if cmp_ready_row_raw >= 0:
-                cmp_ready_row = pl.cast(cmp_ready_row_raw, pl.INDEX)
-                cmp_ready_tile = pl.load(cmp_cache_flat, [cmp_ready_row, 0], [1, 16])
-                cmp_ready_bits = pl.reinterpret_view(cmp_ready_tile, pl.INT16)
-                cmp_ready_sample = pl.tile.read(cmp_ready_bits, [0, 0])
-                cmp_ready_value = pl.cast(cmp_ready_sample, pl.INT32)
-                ready_bit = ready_bit + cmp_ready_value
-        pl.write(cache_ready_fence, [0], ready_bit)
+        for ready_offset in pl.range(HCA_CACHE_READY_TILE):
+            ready_t = ready_block * HCA_CACHE_READY_TILE + ready_offset
+            if ready_t < kv_dim:
+                if ready_t < q_dim:
+                    q_ready_tile = pl.load(q_ready_flat, [ready_t * H, 0], [1, 16])
+                    q_ready_bits = pl.reinterpret_view(q_ready_tile, pl.INT16)
+                    q_ready_sample = pl.tile.read(q_ready_bits, [0, 0])
+                    ready_bit = ready_bit + pl.cast(q_ready_sample, pl.INT32)
+                state_ready_row_raw = pl.read(state_slot_mapping_full, [ready_t])
+                if state_ready_row_raw >= 0:
+                    state_ready_row = pl.cast(state_ready_row_raw, pl.INDEX)
+                    state_ready_sample = pl.read(compress_state_flat, [state_ready_row, 0])
+                    state_ready_bit = pl.cast(state_ready_sample == state_ready_sample, pl.INT32)
+                    ready_bit = ready_bit * state_ready_bit
+                cmp_ready_row_raw = pl.read(cmp_slot_mapping_full, [ready_t])
+                if cmp_ready_row_raw >= 0:
+                    cmp_ready_row = pl.cast(cmp_ready_row_raw, pl.INDEX)
+                    cmp_ready_tile = pl.load(cmp_cache_flat, [cmp_ready_row, 0], [1, 16])
+                    cmp_ready_bits = pl.reinterpret_view(cmp_ready_tile, pl.INT16)
+                    cmp_ready_sample = pl.tile.read(cmp_ready_bits, [0, 0])
+                    cmp_ready_value = pl.cast(cmp_ready_sample, pl.INT32)
+                    ready_bit = ready_bit + cmp_ready_value
+        pl.write(cache_ready_fence, [ready_block], ready_bit)
 
     # Per-request HCA streaming over rank-local packed query intervals.
     with pl.spmd(q_dim, name_hint="prefill_hca_cp_pad_output_init") as pad_output_tid:
@@ -1036,19 +1050,23 @@ def prefill_attention_hca_cp(
     x_normed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     freqs_cos_local = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.BF16)
     freqs_sin_local = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.BF16)
-    for local_row in pl.spmd(q_dim, name_hint="prefill_hca_cp_query_slice"):
-        query_row = pl.load(x_normed_full, [local_base + local_row, 0], [1, D], target_memory=pl.MemorySpace.Vec)
-        pl.store(query_row, [local_row, 0], x_normed_local)
-        query_cos = pl.load(
-            freqs_cos, [local_base + local_row, 0], [1, ROPE_DIM],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        query_sin = pl.load(
-            freqs_sin, [local_base + local_row, 0], [1, ROPE_DIM],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        pl.store(query_cos, [local_row, 0], freqs_cos_local)
-        pl.store(query_sin, [local_row, 0], freqs_sin_local)
+    for block in pl.spmd((q_dim + HCA_QUERY_SLICE_TILE - 1) // HCA_QUERY_SLICE_TILE, name_hint="prefill_hca_cp_query_slice"):
+        row_base = block * HCA_QUERY_SLICE_TILE
+        for row_offset in pl.range(HCA_QUERY_SLICE_TILE):
+            local_row = row_base + row_offset
+            if local_row < q_dim:
+                query_row = pl.load(x_normed_full, [local_base + local_row, 0], [1, D], target_memory=pl.MemorySpace.Vec)
+                pl.store(query_row, [local_row, 0], x_normed_local)
+                query_cos = pl.load(
+                    freqs_cos, [local_base + local_row, 0], [1, ROPE_DIM],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                query_sin = pl.load(
+                    freqs_sin, [local_base + local_row, 0], [1, ROPE_DIM],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                pl.store(query_cos, [local_row, 0], freqs_cos_local)
+                pl.store(query_sin, [local_row, 0], freqs_sin_local)
 
     attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     attn_out_local = prefill_attention_hca_cp_core(
