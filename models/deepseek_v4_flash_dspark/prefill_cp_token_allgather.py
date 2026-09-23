@@ -98,35 +98,24 @@ def _prefill_cp_token_allgather_step(
 
     # Copy peer payloads and publish local readback completion.
     group_rows = TP_SIZE * local_rows
-    with pl.spmd(
-        (group_rows + READBACK_ROW_TILE - 1) // READBACK_ROW_TILE,
-        name_hint="prefill_cp_token_allgather_readback",
-        deps=[_push_tid, _payload_wait_tid],
-    ) as _readback_copy_tid:
-        tile_row = pl.tile.get_block_idx() * READBACK_ROW_TILE
-        if tile_row + READBACK_ROW_TILE <= group_rows:
-            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:D]
-            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
-        else:
-            for tail_offset in pl.range(READBACK_ROW_TILE):
-                tail_row = tile_row + tail_offset
-                if tail_row < group_rows:
-                    window_row = gather_window[tail_row : tail_row + 1, 0:D]
-                    group_out[tail_row : tail_row + 1, 0:D] = window_row
-
+    full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
     with pl.at(
         level=pl.Level.CORE_GROUP,
-        name_hint="prefill_cp_token_allgather_readback_notify",
-        deps=[_readback_copy_tid],
+        name_hint="prefill_cp_token_allgather_readback",
+        deps=[_push_tid, _payload_wait_tid],
     ) as _readback_tid:
-        completion_anchor = pl.read(group_out, [0, 0])
+        for tile_row in pl.range(0, full_rows, READBACK_ROW_TILE):
+            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:D]
+            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
+        for tail_row in pl.range(full_rows, group_rows):
+            window_row = gather_window[tail_row : tail_row + 1, 0:D]
+            group_out[tail_row : tail_row + 1, 0:D] = window_row
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
                 pld.system.notify(
                     target=gather_signal, peer=group_base + peer_tp,
                     offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
                 )
-        pl.write(group_out, [0, 0], completion_anchor)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_readback_wait") as _readback_wait_tid:
         for source_tp in pl.range(TP_SIZE):
