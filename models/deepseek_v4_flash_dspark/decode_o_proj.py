@@ -91,7 +91,7 @@ def _token_tile(capacity, ceiling):
 A_K_TILE = 256
 PROJ_A_MM_N_TILE = 128
 PROJ_A_LARGE_N_TILE = 256
-PROJ_A_ROW_TILE = 128  # proj_a token block; one block covers T_PAD, 8 tasks/group
+PROJ_A_ROW_TILE = 64  # proj_a token row tile
 B_K_TILE = 256
 # Keep the INT32 proj-b accumulator within the A2/A3 tile buffer.
 PROJ_B_MM_T_TILE = _token_tile(T_PAD, 128)
@@ -198,7 +198,7 @@ def _decode_o_proj_tp1_partials(
                 xa_first = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, 0], valid_shape=[pa_rows, A_K_TILE])
                 wa_first = wo_a[g : g + 1, n0 : n0 + A_COL_TILE, 0 : A_K_TILE]
                 acc_a = pl.matmul(xa_first, wa_first, out_dtype=pl.FP32, b_trans=True)
-                for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
+                for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=3):
                     k0 = kb * A_K_TILE
                     xa_k_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, k0], valid_shape=[pa_rows, A_K_TILE])
                     wa_k_chunk = wo_a[g : g + 1, n0 : n0 + A_COL_TILE, k0 : k0 + A_K_TILE]
@@ -355,7 +355,7 @@ def decode_o_proj_tp1(
 
 
 HC_MULT = M.hc_mult
-HC_ACT_TASK_T_TILE = 4
+HC_ACT_TASK_T_TILE = 1
 
 
 @pl.jit.inline

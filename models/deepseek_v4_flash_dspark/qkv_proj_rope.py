@@ -46,8 +46,9 @@ EPS = M.rms_norm_eps
 MAX_SEQ_LEN = M.max_position_embeddings
 
 # tiling
-QPROJ_MM_N_TILE = 256  # qproj output-column tile
-Q_LORA_TILE = 256  # qr rms-norm / quant N granularity
+QPROJ_MM_N_TILE = 1024  # qproj output-column tile
+QPROJ_K_TILE = 128
+Q_LORA_TILE = 512  # qr rms-norm reduction tile
 KV_TILE = 64  # kv rms-norm / rope / NOPE N granularity
 QUANT_TILE = 256
 T_TILE = 8
@@ -65,10 +66,10 @@ KV_K_TILE = 256  # kv_proj D (K) reduction tile   | divides KV_SPLIT_K_TILE
 KV_OK = 4  # kv_proj split-K factor         | D//KV_OK cores share each N-group
 KV_OM = 3  # maximum kv_proj split-M factor
 KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=1024)
-QPROJ_M_TILE = 64  # dense qproj token tile; 64 KiB L0C accumulator
+QPROJ_M_TILE = 32  # dense qproj token tile
 # qproj_matmul runs on persistent workers, one per physical AIC.
-QPROJ_WORKERS = 24
-QPROJ_TAIL_M_TILE = 64
+QPROJ_WORKERS = 16
+QPROJ_TAIL_M_TILE = 32
 # Staging rows for the qr -> qproj handoff: a dense tile is capped at
 # PREFILL_DENSE_TILE rows, so this bounds qproj_t_matmul for every caller.
 QPROJ_T_PAD = ((PREFILL_DENSE_TILE + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
@@ -287,7 +288,7 @@ def q_proj_qr(
             # QR_OK-fold into cube blocks that atomic-add their K partials into a zero-seeded
             # output. Seeded on-core, not through create_tensor init_value=0.
             qr_fp32 = pl.create_tensor([qr_t_matmul, Q_LORA], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed", allow_early_resolve=True):
                 for ts0 in pl.range(0, qr_t_matmul, QR_M_TILE):
                     for nseed0 in pl.range(0, Q_LORA, QR_N_TILE):
                         qr_seed = pl.full([QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0)
@@ -405,7 +406,7 @@ def q_proj_q_matmul(
     qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
     qproj_full_rows = (tile_rows // QPROJ_M_TILE) * QPROJ_M_TILE
     with pl.spmd(
-        QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep],
+        QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep], allow_early_resolve=True,
     ) as qproj_tid:
         # Weight reads bypass L2.
         pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
@@ -414,17 +415,26 @@ def q_proj_q_matmul(
             qproj_worker, (H * HEAD_DIM) // QPROJ_MM_N_TILE, QPROJ_WORKERS,
         ):
             w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
-            wq_full = wq_b[0:Q_LORA, w_col0 : w_col0 + QPROJ_MM_N_TILE]
             for t0 in pl.range(0, qproj_full_rows, QPROJ_M_TILE):
-                qr_full = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, 0:Q_LORA]
-                col_acc = pl.matmul(qr_full, wq_full, out_dtype=pl.INT32)
+                col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
+                for qproj_k in pl.pipeline(Q_LORA // QPROJ_K_TILE, stage=3):
+                    qproj_k0 = qproj_k * QPROJ_K_TILE
+                    qr_full = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, qproj_k0 : qproj_k0 + QPROJ_K_TILE]
+                    wq_chunk = wq_b[qproj_k0 : qproj_k0 + QPROJ_K_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
+                    col_acc = pl.matmul_acc(col_acc, qr_full, wq_chunk, init_cond=(qproj_k == 0))
                 q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
             tail_w_col0 = w_col0
             for tail_t0 in pl.range(qproj_full_rows, qproj_t_matmul, QPROJ_TAIL_M_TILE):
                 qproj_tail_rows = pl.min(QPROJ_TAIL_M_TILE, tile_rows - tail_t0)
-                qr_i8_tail = pl.slice(qr_i8_matmul, [QPROJ_TAIL_M_TILE, Q_LORA], [tail_t0, 0], valid_shape=[qproj_tail_rows, Q_LORA])
-                tail_acc = pl.matmul(qr_i8_tail, wq_full, out_dtype=pl.INT32)
+                qr_i8_tail = pl.slice(qr_i8_matmul, [QPROJ_TAIL_M_TILE, QPROJ_K_TILE], [tail_t0, 0], valid_shape=[qproj_tail_rows, QPROJ_K_TILE])
+                tail_w_first = wq_b[0:QPROJ_K_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
+                tail_acc = pl.matmul(qr_i8_tail, tail_w_first, out_dtype=pl.INT32)
+                for tail_k in pl.pipeline(1, Q_LORA // QPROJ_K_TILE, stage=3):
+                    tail_k0 = tail_k * QPROJ_K_TILE
+                    qr_tail_chunk = pl.slice(qr_i8_matmul, [QPROJ_TAIL_M_TILE, QPROJ_K_TILE], [tail_t0, tail_k0], valid_shape=[qproj_tail_rows, QPROJ_K_TILE])
+                    tail_w_chunk = wq_b[tail_k0 : tail_k0 + QPROJ_K_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
+                    tail_acc = pl.matmul_acc(tail_acc, qr_tail_chunk, tail_w_chunk)
                 q_proj_i32[
                     tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
                     tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
@@ -447,17 +457,19 @@ def q_proj_q_dequant(
     """Dequantize, normalize, and rotate one projected Q tile."""
     t_dim = pl.tensor.dim(q, 0)
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
+    dq_head_tile = Q_ROPE_H_TILE
+    if tile_rows >= Q_DEQUANT_WORKERS * Q_ROPE_T_TILE and tile_rows % (Q_DEQUANT_WORKERS * Q_ROPE_T_TILE) == 0:
+        dq_head_tile = H
+    elif tile_rows >= Q_DEQUANT_WORKERS * Q_ROPE_T_TILE * 16 // H and tile_rows % (Q_DEQUANT_WORKERS * Q_ROPE_T_TILE * 16 // H) == 0:
+        dq_head_tile = 16
+    dq_items = ((tile_rows + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE) * (H // dq_head_tile)
+    dq_workers = pl.min(Q_DEQUANT_WORKERS, dq_items)
     for dq_worker in pl.spmd(
-        Q_DEQUANT_WORKERS, name_hint="qproj_dequant_rms_nope_rope",
+        dq_workers, name_hint="qproj_dequant_rms_nope_rope",
         allow_early_resolve=True,
     ):
-        dq_head_tile = Q_ROPE_H_TILE
-        if tile_rows >= Q_DEQUANT_WORKERS * Q_ROPE_T_TILE and tile_rows % (Q_DEQUANT_WORKERS * Q_ROPE_T_TILE) == 0:
-            dq_head_tile = H
-        elif tile_rows >= Q_DEQUANT_WORKERS * Q_ROPE_T_TILE * 16 // H and tile_rows % (Q_DEQUANT_WORKERS * Q_ROPE_T_TILE * 16 // H) == 0:
-            dq_head_tile = 16
         for dq_work in pl.range(
-            dq_worker, ((tile_rows + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE) * (H // dq_head_tile), Q_DEQUANT_WORKERS,
+            dq_worker, dq_items, dq_workers,
         ):
             hg = (dq_work % (H // dq_head_tile)) * dq_head_tile
             tg = (dq_work // (H // dq_head_tile)) * Q_ROPE_T_TILE
