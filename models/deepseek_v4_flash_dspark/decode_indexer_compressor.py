@@ -77,7 +77,8 @@ RMS_WORKERS = 2  # RMSNorm + RoPE workers
 COMMIT_WORKERS = 16
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
 BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
-HEAD_TILE = 64
+HEAD_TILE = 128
+RMS_HEAD_TILE = 64
 RMS_PAD_TILE = 16  # 16-row block of B (hadamard matmul M multiple of 16)
 
 
@@ -98,7 +99,8 @@ def indexer_compressor_project(
 
     # Caller-ordered KV and score projections.
     with pl.spmd(
-        KV_SCORE_WORKERS, name_hint="kv_score_proj", deps=[late_dep, chain_dep],
+        pl.min(KV_SCORE_WORKERS, t_matmul * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE)),
+        name_hint="kv_score_proj", deps=[late_dep, chain_dep],
     ) as _kv_score_tid:
         # Weight reads bypass L2.
         pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
@@ -155,7 +157,7 @@ def indexer_compressor_pool_projected(
     # Ratio-4 state-ring pooling.
     pooled_kv = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
     pool_workers = pl.min(b_dim, POOL_WORKERS)
-    with pl.spmd(pool_workers, name_hint="scatter_softmax_pool", deps=[_kv_score_tid]) as pool_tid:
+    with pl.spmd(pool_workers, name_hint="scatter_softmax_pool", deps=[_kv_score_tid], allow_early_resolve=True) as pool_tid:
         pool_worker = pl.tile.get_block_idx()
         for c_idx in pl.range(pool_worker, b_dim, pool_workers):
             first_pos_b = pl.read(position_ids, [c_idx * s_dim])
@@ -234,7 +236,7 @@ def indexer_compressor_pool_projected(
 
     # Recurrent state-ring commit.
     commit_workers = pl.min(b_dim, COMMIT_WORKERS)
-    with pl.spmd(commit_workers, name_hint="compress_state_commit", deps=[pool_tid]):
+    with pl.spmd(commit_workers, name_hint="compress_state_commit", deps=[pool_tid], allow_early_resolve=True):
         commit_worker = pl.tile.get_block_idx()
         for c_idx in pl.range(commit_worker, b_dim, commit_workers):
             for s_idx in pl.range(s_dim):
@@ -253,7 +255,7 @@ def indexer_compressor_pool_projected(
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     rms_workers = pl.min(rms_blocks, RMS_WORKERS)
-    with pl.spmd(rms_workers, name_hint="rmsnorm_rope", deps=[pool_tid]) as rms_tid:
+    with pl.spmd(rms_workers, name_hint="rmsnorm_rope", deps=[pool_tid], allow_early_resolve=True) as rms_tid:
         rms_worker = pl.tile.get_block_idx()
         rope_ones = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         rope_index = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -269,8 +271,8 @@ def indexer_compressor_pool_projected(
             cos_b = pl.slice(cos, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[rms_blk_rows, ROPE_HEAD_DIM])
             sin_b = pl.slice(sin, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[rms_blk_rows, ROPE_HEAD_DIM])
             partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
-            for k0 in pl.pipeline(0, HEAD_DIM, HEAD_TILE, stage=2):
-                kv_rms_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
+            for k0 in pl.pipeline(0, HEAD_DIM, RMS_HEAD_TILE, stage=2):
+                kv_rms_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, k0 : k0 + RMS_HEAD_TILE]
                 kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
                 kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_PAD_TILE])
                 partial_sq = pl.add(partial_sq, kv_rms_rowsum)
@@ -360,34 +362,28 @@ def indexer_compressor_write(
     idx_kv_scale_values = pl.create_tensor([BS_PAD, 1], dtype=pl.FP32)
 
     kv_final = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
-    # Caller-ordered KV Hadamard projection.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="kv_hadamard", deps=[rms_tid, hadamard_dep],
-    ) as hadamard_tid:
-        # Hadamard column tiles.
-        for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
-            hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
-            for had_blk in pl.range(rms_blocks):
-                had_b0 = had_blk * RMS_PAD_TILE
-                had_rows = pl.min(RMS_PAD_TILE, compact_rows - had_b0)
-                kv_proj_tile = pl.slice(normed_kv, [RMS_PAD_TILE, HEAD_DIM], [had_b0, 0], valid_shape=[had_rows, HEAD_DIM])
-                kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-                kv_final[had_b0 : had_b0 + RMS_PAD_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
-
+    # Compact KV Hadamard, quantization, and cache rows.
     with pl.spmd(
-        rms_blocks, name_hint="kv_and_cache_write", deps=[hadamard_tid], allow_early_resolve=True,
+        rms_blocks, name_hint="kv_hadamard_quant_cache", deps=[rms_tid, hadamard_dep],
+        allow_early_resolve=True, optimizations=[pl.cross_core_slot(slot_num=1)],
     ) as _write_tid:
         wr_blk = pl.tile.get_block_idx()
-        # C8 per-row INT8 cache quantization.
         wr_b0 = wr_blk * RMS_PAD_TILE
         wr_blk_rows = pl.min(RMS_PAD_TILE, compact_rows - wr_b0)
-        kv_blk_f32 = pl.cast(
-            pl.cast(kv_final[wr_b0 : wr_b0 + RMS_PAD_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint"),
-            target_type=pl.FP32)
+        hadamard_tile = hadamard[0:HEAD_DIM, 0:HEAD_DIM]
+        kv_proj_tile = pl.slice(normed_kv, [RMS_PAD_TILE, HEAD_DIM], [wr_b0, 0], valid_shape=[wr_blk_rows, HEAD_DIM])
+        kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
+        kv_final[wr_b0 : wr_b0 + RMS_PAD_TILE, 0:HEAD_DIM] = kv_hadamard_acc
+        kv_blk_bf16 = pl.cast(kv_hadamard_acc, target_type=pl.BF16, mode="rint")
+        kv_blk_f32 = pl.cast(kv_blk_bf16, target_type=pl.FP32)
         # Per-row absolute maximum.
         kv_amax = pl.reshape(pl.row_max(pl.abs(kv_blk_f32)), [1, RMS_PAD_TILE])
-        kv_amax = pl.maximum(kv_amax, pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS))
-        kv_scale_q_row = pl.div(pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
+        kv_amax_floor = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        kv_amax_floor = pl.set_validshape(kv_amax_floor, 1, wr_blk_rows)
+        kv_amax = pl.maximum(kv_amax, kv_amax_floor)
+        kv_scale_numerator = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+        kv_scale_numerator = pl.set_validshape(kv_scale_numerator, 1, wr_blk_rows)
+        kv_scale_q_row = pl.div(kv_scale_numerator, kv_amax)
         kv_scale_dq_col = pl.reshape(pl.recip(kv_scale_q_row), [RMS_PAD_TILE, 1])
         kv_scale_q_col = pl.reshape(kv_scale_q_row, [RMS_PAD_TILE, 1])
         idx_kv_scale_values[
@@ -410,7 +406,8 @@ def indexer_compressor_write(
                 if cache_row_i64 >= 0:
                     cache_row = pl.cast(cache_row_i64, pl.INDEX)
                     kv_flat[token : token + 1, :] = kv_final[compact_token : compact_token + 1, 0 : HEAD_DIM]
-                    idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_i8_blk[inner : inner + 1, :]
+                    kv_i8_row = pl.slice(kv_i8_blk, [1, HEAD_DIM], [inner, 0], valid_shape=[1, HEAD_DIM])
+                    idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_i8_row
 
     # Serialized indexer-cache scale commit.
     with pl.at(
@@ -435,7 +432,7 @@ def indexer_compressor_write(
                         pl.read(idx_kv_scale_values, [compact_token, 0]),
                     )
 
-    return hadamard_tid, scale_commit_tid
+    return _write_tid, scale_commit_tid
 
 
 @pl.jit.inline

@@ -92,7 +92,8 @@ def compressor_ratio4_project(
 
     # Caller-ordered KV and score projections.
     with pl.spmd(
-        KV_SCORE_WORKERS, name_hint="kv_score_proj", deps=[late_dep],
+        pl.min(KV_SCORE_WORKERS, t_matmul * OUT_DIM // (MM_B_TILE * OUT_TILE)),
+        name_hint="kv_score_proj", deps=[late_dep],
     ) as _kv_score_tid:
         # Weight reads bypass L2.
         pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)

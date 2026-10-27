@@ -91,7 +91,7 @@ def _token_tile(capacity, ceiling):
 A_K_TILE = 256
 PROJ_A_MM_N_TILE = 128
 PROJ_A_LARGE_N_TILE = 256
-PROJ_A_ROW_TILE = 64  # proj_a token row tile
+PROJ_A_ROW_TILE = 16  # proj_a token row tile
 B_K_TILE = 256
 # Keep the INT32 proj-b accumulator within the A2/A3 tile buffer.
 PROJ_B_MM_T_TILE = _token_tile(T_PAD, 128)
@@ -188,6 +188,7 @@ def _decode_o_proj_tp1_partials(
 
             with pl.spmd(proj_a_rows * (O_LORA // A_COL_TILE), name_hint="proj_a_mm", deps=[heads_dep],
                          allow_early_resolve=True) as pa_tid:
+                pl.set_cache_policy(wo_a, pl.CachePolicy.BYPASS)
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // (O_LORA // A_COL_TILE)  # row block outermost
                 nf = pa_unit % (O_LORA // A_COL_TILE)
@@ -255,6 +256,7 @@ def _decode_o_proj_tp1_partials(
                     dc = pb_unit % (D // PROJ_B_D_TILE)
                     t0 = tb * ROW_TILE
                     d0 = dc * PROJ_B_D_TILE
+                    pl.set_cache_policy(wo_b, pl.CachePolicy.BYPASS)
                     # Both N256 outputs consume the same activation. Keep it in
                     # L1 while streaming weights through the existing K pipeline.
                     activation_l1 = pl.load(
