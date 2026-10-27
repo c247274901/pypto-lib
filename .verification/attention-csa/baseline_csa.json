@@ -1,0 +1,548 @@
+{
+  "batch": 1,
+  "block_medians_us": [
+    335.14,
+    337.961,
+    334.1,
+    334.62
+  ],
+  "effective_us": 335.51,
+  "error": null,
+  "golden_replayed": true,
+  "k": 7,
+  "logical_device": 0,
+  "outcome": "valid",
+  "platform": "a2a3",
+  "positions": [
+    8192,
+    8193,
+    8194,
+    8195,
+    8196,
+    8197,
+    8198,
+    8199
+  ],
+  "query_rows": 8,
+  "reference_revision": "7cabb8ba022929bf09cc3cffd8cdadc3351de1fd",
+  "relative_block_range": 0.011507853715239456,
+  "rounds": 100,
+  "samples_us": [
+    332.12,
+    325.44,
+    336.439,
+    336,
+    335.14,
+    341.62,
+    333.98,
+    333.301,
+    332.44,
+    325.94,
+    338.779,
+    324.718,
+    342.28,
+    322.54,
+    347.18,
+    330.599,
+    327.92,
+    336.821,
+    341.76,
+    343.14,
+    328.361,
+    344.96,
+    334.5,
+    340.5,
+    351.3,
+    338.62,
+    339.839,
+    334.4,
+    346.92,
+    342.38,
+    344.541,
+    331.001,
+    333.86,
+    337.02,
+    336.8,
+    339.82,
+    346.68,
+    328.82,
+    337.961,
+    340.64,
+    334.22,
+    336.08,
+    336.139,
+    342.5,
+    334.7,
+    343.519,
+    342.48,
+    336.3,
+    335.88,
+    346.32,
+    341.46,
+    332.301,
+    333.979,
+    340.84,
+    331.401,
+    338.42,
+    336.24,
+    341.6,
+    339.96,
+    324.52,
+    328.221,
+    338.12,
+    333.68,
+    333.96,
+    333.74,
+    334.859,
+    334.22,
+    328.74,
+    324.9,
+    342.24,
+    332.62,
+    353,
+    327.98,
+    342.52,
+    334.1,
+    336.38,
+    335,
+    334.62,
+    339.861,
+    349.039,
+    338.82,
+    327.3,
+    333.501,
+    328.539,
+    335.02,
+    345.14,
+    332.9,
+    332.079,
+    324.66,
+    331.1,
+    343.981,
+    338.94,
+    340.62,
+    342.499,
+    328.941,
+    329.64,
+    325.819,
+    333.021,
+    334.901,
+    329.419
+  ],
+  "snapshot": "/data/disk/chenwangyi/goal-plus-playground/.workspace/ws_deepseek-dspark-decode-attention_363209154b79/evidence/attention/data/csa",
+  "source_revision": "2b4a4e238b1ced4c4a2b9520781405d1c5831f36",
+  "specs": [
+    {
+      "dtype": "torch.float32",
+      "name": "x_hc",
+      "shape": [
+        8,
+        4,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_fn",
+      "shape": [
+        24,
+        16384
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_scale",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_base",
+      "shape": [
+        24
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "attn_norm_w",
+      "shape": [
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wq_a",
+      "shape": [
+        4096,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "wq_b",
+      "shape": [
+        1024,
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "wq_b_scale",
+      "shape": [
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wkv",
+      "shape": [
+        4096,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "gamma_cq",
+      "shape": [
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "gamma_ckv",
+      "shape": [
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "freqs_cos",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "freqs_sin",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_freqs_cos",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_freqs_sin",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_wkv",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_wgate",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "cmp_ape",
+      "shape": [
+        4,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_norm_w",
+      "shape": [
+        512
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "compress_state",
+      "shape": [
+        512,
+        2,
+        2048
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "compress_state_block_table",
+      "shape": [
+        1,
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "idx_wq_b",
+      "shape": [
+        1024,
+        8192
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "idx_wq_b_scale",
+      "shape": [
+        8192
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "weights_proj",
+      "shape": [
+        4096,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "hadamard_idx",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "inner_wkv",
+      "shape": [
+        256,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "inner_wgate",
+      "shape": [
+        256,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "inner_ape",
+      "shape": [
+        4,
+        256
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "inner_norm_w",
+      "shape": [
+        128
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "inner_compress_state",
+      "shape": [
+        512,
+        2,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "inner_compress_state_block_table",
+      "shape": [
+        1,
+        8
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "kv_cache",
+      "shape": [
+        512,
+        32,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_kv",
+      "shape": [
+        65,
+        32,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "cmp_block_table",
+      "shape": [
+        1,
+        8192
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "idx_kv_cache",
+      "shape": [
+        65,
+        32,
+        1,
+        128
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "idx_kv_scale",
+      "shape": [
+        65,
+        32,
+        1,
+        1
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "idx_block_table",
+      "shape": [
+        1,
+        8192
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "ori_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "window_swa_indices",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "window_swa_lens",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "cmp_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "idx_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "state_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "inner_state_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "position_ids",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "kv_seq_lens",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "attn_sink",
+      "shape": [
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wo_a",
+      "shape": [
+        8,
+        1024,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "wo_b",
+      "shape": [
+        8,
+        4096,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "wo_b_scale",
+      "shape": [
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "x_out",
+      "shape": [
+        8,
+        4,
+        4096
+      ]
+    }
+  ],
+  "stage": "csa",
+  "tp": 1,
+  "visible_devices": "7",
+  "warmup": 5,
+  "work_dir": "/data/disk/chenwangyi/goal-plus-playground/.workspace/ws_deepseek-dspark-decode-attention_363209154b79/modules/pypto-lib/.tmp/main-after-swa-csa-vatBEE/pypto-build/_jit__decode_csa_tp1_20261028_004018_p7i3if2p",
+  "source_model_tree": "cde8d7305fa4a9699241f16b9f10dec0ca67b51b",
+  "baseline_evidence": "Main actual-source independent replay after SWA promotion. Delivery7417d9b383da2b578d05a6525eb88a8b72d1ae5b changes only commit metadata relative to measured2b4a4e238b1ced4c4a2b9520781405d1c5831f36; all files/model tree identical.",
+  "baseline_stage": "CSA after accepted SWA",
+  "baseline_original_report": "evidence/attention/reports/main-after-swa-csa.json"
+}
