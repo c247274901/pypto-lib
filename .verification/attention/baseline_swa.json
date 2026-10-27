@@ -1,0 +1,313 @@
+{
+  "batch": 1,
+  "effective_us": 263.3595,
+  "error": null,
+  "golden_replayed": false,
+  "k": 7,
+  "logical_device": 0,
+  "outcome": "valid",
+  "platform": "a2a3",
+  "positions": [
+    8192,
+    8193,
+    8194,
+    8195,
+    8196,
+    8197,
+    8198,
+    8199
+  ],
+  "query_rows": 8,
+  "reference_revision": "7cabb8ba022929bf09cc3cffd8cdadc3351de1fd",
+  "rounds": 100,
+  "samples_us": [
+    264.8,
+    264.18,
+    264.92,
+    259,
+    268.64,
+    267.9,
+    258.62,
+    266.46,
+    265.039,
+    270.86,
+    260.36,
+    265.2,
+    260.66,
+    267.44,
+    260.819,
+    263.64,
+    262.32,
+    269.82,
+    261.1,
+    261.001,
+    263.48,
+    260.86,
+    263.68,
+    261.6,
+    264.72,
+    262.44,
+    266.279,
+    272.26,
+    278.4,
+    264.76,
+    262.98,
+    263.419,
+    267.44,
+    263.64,
+    263.839,
+    265.18,
+    265.24,
+    265,
+    264.28,
+    263.84,
+    263.3,
+    272.2,
+    254.72,
+    260.62,
+    261.219,
+    262.22,
+    265.1,
+    267,
+    261.039,
+    264.6,
+    257.32,
+    267.06,
+    261.94,
+    261.639,
+    262.819,
+    259.039,
+    259.32,
+    261.92,
+    262.44,
+    262.52,
+    259.58,
+    260.999,
+    261.899,
+    267.899,
+    262.46,
+    264.561,
+    261.88,
+    269.4,
+    272.22,
+    262.599,
+    267.7,
+    260.48,
+    261.16,
+    267.92,
+    260.68,
+    269.28,
+    262.959,
+    262.26,
+    268.039,
+    271.14,
+    261.26,
+    266.98,
+    264.499,
+    270.739,
+    263.22,
+    267.98,
+    265.26,
+    262.8,
+    262.801,
+    265.679,
+    263.299,
+    260.3,
+    259.579,
+    262.1,
+    267.58,
+    260.479,
+    264.138,
+    262.3,
+    258.92,
+    262.821
+  ],
+  "source_revision": "7cabb8ba022929bf09cc3cffd8cdadc3351de1fd",
+  "specs": [
+    {
+      "dtype": "torch.float32",
+      "name": "x_hc",
+      "shape": [
+        8,
+        4,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_fn",
+      "shape": [
+        24,
+        16384
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_scale",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_base",
+      "shape": [
+        24
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "attn_norm_w",
+      "shape": [
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wq_a",
+      "shape": [
+        4096,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "wq_b",
+      "shape": [
+        1024,
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "wq_b_scale",
+      "shape": [
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wkv",
+      "shape": [
+        4096,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "gamma_cq",
+      "shape": [
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "gamma_ckv",
+      "shape": [
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "freqs_cos",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "freqs_sin",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "kv_cache",
+      "shape": [
+        512,
+        32,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "swa_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "swa_indices",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "swa_lens",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "position_ids",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "attn_sink",
+      "shape": [
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wo_a",
+      "shape": [
+        8,
+        1024,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "wo_b",
+      "shape": [
+        8,
+        4096,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "wo_b_scale",
+      "shape": [
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "x_out",
+      "shape": [
+        8,
+        4,
+        4096
+      ]
+    }
+  ],
+  "stage": "swa",
+  "tp": 1,
+  "visible_devices": "0",
+  "warmup": 5,
+  "evidence_ref": "evidence/attention/reports/initial-swa.json",
+  "source_model_tree": "4d867e3047c9746bfc4f51c95915ca13a95b92ce"
+}

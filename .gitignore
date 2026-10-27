@@ -20,6 +20,7 @@ develop-eggs/
 
 # Project build artifacts
 build_output/
+.tmp/
 pa_build/
 site/
 .site-theme/

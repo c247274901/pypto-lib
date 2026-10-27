@@ -1,0 +1,328 @@
+{
+  "reference_revision": "7cabb8ba022929bf09cc3cffd8cdadc3351de1fd",
+  "specs": [
+    {
+      "dtype": "torch.float32",
+      "name": "x_hc",
+      "shape": [
+        8,
+        4,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_fn",
+      "shape": [
+        24,
+        16384
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_scale",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_base",
+      "shape": [
+        24
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "attn_norm_w",
+      "shape": [
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wq_a",
+      "shape": [
+        4096,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "wq_b",
+      "shape": [
+        1024,
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "wq_b_scale",
+      "shape": [
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wkv",
+      "shape": [
+        4096,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "gamma_cq",
+      "shape": [
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "gamma_ckv",
+      "shape": [
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "freqs_cos",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "freqs_sin",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "cmp_freqs_cos",
+      "shape": [
+        64,
+        32
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "cmp_freqs_sin",
+      "shape": [
+        64,
+        32
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_wkv",
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_wgate",
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "cmp_ape",
+      "shape": [
+        128,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_norm_w",
+      "shape": [
+        512
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "compress_state",
+      "shape": [
+        1088,
+        8,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "compress_state_block_table",
+      "shape": [
+        1,
+        131072
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "kv_cache",
+      "shape": [
+        512,
+        32,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "cmp_kv",
+      "shape": [
+        8192,
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "cmp_block_table",
+      "shape": [
+        1,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "ori_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "window_swa_indices",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "window_swa_lens",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "cmp_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "state_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "position_ids",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "kv_seq_lens",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "attn_sink",
+      "shape": [
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wo_a",
+      "shape": [
+        8,
+        1024,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "wo_b",
+      "shape": [
+        8,
+        4096,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "wo_b_scale",
+      "shape": [
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "x_out",
+      "shape": [
+        8,
+        4,
+        4096
+      ]
+    }
+  ],
+  "tensors": {
+    "in/attn_norm_w.pt": "accbe8d91b0ed4406e9241c54a3254b314c1743d80d108ca1d2a2efe892bc530",
+    "in/attn_sink.pt": "ea47acdd10e654c0abc9217ab648563c04029feef6991b1dc8ac3cbaa78f014e",
+    "in/cmp_ape.pt": "79841234280773572b88aa61654236ac00e3ec3804c9893278c424f6229d509c",
+    "in/cmp_block_table.pt": "19e465c35eb1bd9dc5077c9e379df19e1ab83b53e57d612126b70e417dfce73a",
+    "in/cmp_freqs_cos.pt": "e6ddc1ebbe82fb1f254bb9ecc5a5dbebb7bd5f9355c49736b550aca994e855ad",
+    "in/cmp_freqs_sin.pt": "3a4244cc97adcd4a14ca59f66bf52aff454d41e14dc4437b42bcb521a5ec59c0",
+    "in/cmp_kv.pt": "bd081d6f58c6bfd275d095a066c8a4c7178925f573f6491bd464b912224ef979",
+    "in/cmp_norm_w.pt": "f8ab555391f01e8e5bc299cc16a857250ca2934a318a2a71d9ba08611a91f9b7",
+    "in/cmp_slot_mapping.pt": "8925960c4469e2d611bf0a55b249fd390f6669e4a1872bff7ffccb9c93de9a48",
+    "in/cmp_wgate.pt": "577d77f6601b8707df5e6a79a8bff098f08d1460aa02a4a85016877a07d7c47c",
+    "in/cmp_wkv.pt": "352c0b1799c1f232be1fb18f0947f69a43f95c82e31cd383778a76105a2fc93b",
+    "in/compress_state.pt": "2c1cd8bcf1fc914d92308ed201804a46133ce7d76f87b5689aa20e77a5662ae4",
+    "in/compress_state_block_table.pt": "73646ab1a5ff21f5d7407361b7d6c7bd38eb0504447eca2ff87c54c41cf1dc88",
+    "in/freqs_cos.pt": "e1bd7be7195b55439074ed6a0e4f6d91d9036689a9f5ed2a683a2b5623d883d0",
+    "in/freqs_sin.pt": "1de1c8310bc75212265606b632641bfe48233be968226669f11045532fe1c2d9",
+    "in/gamma_ckv.pt": "ead36eb87475c875df51e314841473fdaa809ac88015e8671d773a3935c2527e",
+    "in/gamma_cq.pt": "ba23fc378c22a52e66e961df256073e919935834419371541b9141f2e5a099fa",
+    "in/hc_attn_base.pt": "0d9989898f1510f3fcbe5f521a62072f30c8cb9739f4f8937bd61d1e56a48975",
+    "in/hc_attn_fn.pt": "0722e017e7100aae8bb11d26be690c92b821c83ce67bc1120cd684911e300303",
+    "in/hc_attn_scale.pt": "545aa05a404f98a188f926bcafe7c5c923e45bf758ba090ddf6c4795d230dbb2",
+    "in/kv_cache.pt": "dd5e0d3fd7d9a1c65b7db8735b4281a926fba8909a5dc6aac5e9ff0e4af31903",
+    "in/kv_seq_lens.pt": "8697a5fb2190d6dc1a6b4342e9b6c7ca3bdba0729df282eb35b17c1621ef37ff",
+    "in/ori_slot_mapping.pt": "ae65e287ced594512f6bf9bf6569caad781cc373c2bb8149edcf850bb71d5b2e",
+    "in/position_ids.pt": "bd0b682ef8886613e342642212d9a6851b3afc5c36f7b08056920afcf7ef6466",
+    "in/state_slot_mapping.pt": "ef9750c0028300bd062688f6fd605da55a3bf9a7759704c16fd5ea3726348d2b",
+    "in/window_swa_indices.pt": "08570f566e8dfd969b580dc7785440c251e55c74a257cd3c800a349740280a7e",
+    "in/window_swa_lens.pt": "fa159c2f3d663860e8f264218ce8d1b412811413da4514d6a02b3d33b9bab074",
+    "in/wkv.pt": "429d8be2ccf3017b2f6005c9479316fa0420f4606e16306934a33458dce12322",
+    "in/wo_a.pt": "36a1c70e67f1f44a438c54cecf5cd1a9aa6089979baec98827cc49fcefa42d2c",
+    "in/wo_b.pt": "c613684c2d692769658523f4347c8e6d79b377fa26743d4a79f5930f26c415c5",
+    "in/wo_b_scale.pt": "50ab9ccc6635639b7af490920c07982deb00f173233e51004f769451e93fb56f",
+    "in/wq_a.pt": "128a47c3fd625c493ac14fa22b13cceca17059844ffa632b24a1599e5437a9e9",
+    "in/wq_b.pt": "24ceb177536fc6a3e5c69b9366f2cf8192fb9ba540691831b027fbca13e2aee7",
+    "in/wq_b_scale.pt": "f5b8f0ad11b802b502cfa84b511646528c8e6b0560313c0ce7975f59b46dcef0",
+    "in/x_hc.pt": "a382d335bf87e06ba34ff8aaca25b6878a3f0fb4d69f855441fe58e10d6f0b93",
+    "out/cmp_kv.pt": "bd081d6f58c6bfd275d095a066c8a4c7178925f573f6491bd464b912224ef979",
+    "out/compress_state.pt": "c69881cf80c9479d357204c09f6886f574116f5753ba05234fd975c2c3076ab8",
+    "out/kv_cache.pt": "901a04d1d8c4b266308693a4d3dbdf201e8e591a2394dc9e82c5c687db693ca3",
+    "out/x_out.pt": "098705d5fe70745bcc1cf1d2a02c9b727a7e48e12832c336a825ec579ff04c73"
+  }
+}

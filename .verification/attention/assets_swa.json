@@ -1,0 +1,210 @@
+{
+  "reference_revision": "7cabb8ba022929bf09cc3cffd8cdadc3351de1fd",
+  "specs": [
+    {
+      "dtype": "torch.float32",
+      "name": "x_hc",
+      "shape": [
+        8,
+        4,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_fn",
+      "shape": [
+        24,
+        16384
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_scale",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "hc_attn_base",
+      "shape": [
+        24
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "attn_norm_w",
+      "shape": [
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wq_a",
+      "shape": [
+        4096,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "wq_b",
+      "shape": [
+        1024,
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "wq_b_scale",
+      "shape": [
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wkv",
+      "shape": [
+        4096,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "gamma_cq",
+      "shape": [
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "gamma_ckv",
+      "shape": [
+        512
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "freqs_cos",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "freqs_sin",
+      "shape": [
+        8,
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "kv_cache",
+      "shape": [
+        512,
+        32,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "name": "swa_slot_mapping",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "swa_indices",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "swa_lens",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.int32",
+      "name": "position_ids",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "attn_sink",
+      "shape": [
+        64
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "name": "wo_a",
+      "shape": [
+        8,
+        1024,
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.int8",
+      "name": "wo_b",
+      "shape": [
+        8,
+        4096,
+        1024
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "wo_b_scale",
+      "shape": [
+        4096
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "name": "x_out",
+      "shape": [
+        8,
+        4,
+        4096
+      ]
+    }
+  ],
+  "tensors": {
+    "in/attn_norm_w.pt": "accbe8d91b0ed4406e9241c54a3254b314c1743d80d108ca1d2a2efe892bc530",
+    "in/attn_sink.pt": "ea47acdd10e654c0abc9217ab648563c04029feef6991b1dc8ac3cbaa78f014e",
+    "in/freqs_cos.pt": "a2f6c9cde729a27a6cfa07fe6546914d5c11d4d89d145dbeaebea48c72ef32c9",
+    "in/freqs_sin.pt": "5a60dd3596bb777359bf91c6af7b27b2eed0d56f9bac33133984e07024658f2b",
+    "in/gamma_ckv.pt": "ead36eb87475c875df51e314841473fdaa809ac88015e8671d773a3935c2527e",
+    "in/gamma_cq.pt": "ba23fc378c22a52e66e961df256073e919935834419371541b9141f2e5a099fa",
+    "in/hc_attn_base.pt": "9ab3cb5706c68f1d83d564feb04dacc3576608ada803fd94343e575dc70bb368",
+    "in/hc_attn_fn.pt": "b343c93cd86304fe6ce3cb32968ee2aeb9814bf6c8d36aaf484010f968f30b90",
+    "in/hc_attn_scale.pt": "4fee7d0538ccbbc3d03664285fddc4c42721ad8aeb42018acc9953c8c118fb5a",
+    "in/kv_cache.pt": "0af3d71025826a38dc4daa0f7cbe6d9a6d43819bfcc744f9e2db1877e1fec6b2",
+    "in/position_ids.pt": "bd0b682ef8886613e342642212d9a6851b3afc5c36f7b08056920afcf7ef6466",
+    "in/swa_indices.pt": "a95a0c0585e0dba3881d754b5ddeb060c7a621048c0aeab6d815d94506b0398c",
+    "in/swa_lens.pt": "24935bd1ad4181b3f819d7022286d77e0b9cb0ee1e0d8bbf6bdf48c9e7aff2aa",
+    "in/swa_slot_mapping.pt": "3d7d7cb9a0d7dbd701dc063ac277d5682e503903aa8f1b171a8de3ab2a9e1784",
+    "in/wkv.pt": "429d8be2ccf3017b2f6005c9479316fa0420f4606e16306934a33458dce12322",
+    "in/wo_a.pt": "b443de3ea40627a9e087461d2d941ac51ae7b7dd2bfcab371c5a536b3239a87c",
+    "in/wo_b.pt": "c613684c2d692769658523f4347c8e6d79b377fa26743d4a79f5930f26c415c5",
+    "in/wo_b_scale.pt": "50ab9ccc6635639b7af490920c07982deb00f173233e51004f769451e93fb56f",
+    "in/wq_a.pt": "128a47c3fd625c493ac14fa22b13cceca17059844ffa632b24a1599e5437a9e9",
+    "in/wq_b.pt": "24ceb177536fc6a3e5c69b9366f2cf8192fb9ba540691831b027fbca13e2aee7",
+    "in/wq_b_scale.pt": "f5b8f0ad11b802b502cfa84b511646528c8e6b0560313c0ce7975f59b46dcef0",
+    "in/x_hc.pt": "a382d335bf87e06ba34ff8aaca25b6878a3f0fb4d69f855441fe58e10d6f0b93",
+    "out/kv_cache.pt": "45044416efbf203f103c656c9251d19aa910bebd878e498cdbf75bb9c38666e0",
+    "out/x_out.pt": "27e6c9cc5b1b2303891a1fe8ec7572757bd02656376fc0bec4870892532a021e"
+  }
+}
