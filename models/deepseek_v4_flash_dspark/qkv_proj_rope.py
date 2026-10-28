@@ -68,8 +68,8 @@ KV_OM = 3  # maximum kv_proj split-M factor
 KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=1024)
 QPROJ_M_TILE = 32  # dense qproj token tile
 # qproj_matmul runs on persistent workers, one per physical AIC.
-QPROJ_WORKERS = 16
-QPROJ_TAIL_M_TILE = 32
+QPROJ_WORKERS = 32
+QPROJ_TAIL_M_TILE = 16
 # Staging rows for the qr -> qproj handoff: a dense tile is capped at
 # PREFILL_DENSE_TILE rows, so this bounds qproj_t_matmul for every caller.
 QPROJ_T_PAD = ((PREFILL_DENSE_TILE + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE

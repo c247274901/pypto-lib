@@ -101,7 +101,7 @@ PROJ_B_MM_N_TILE = 256
 PROJ_B_ACT_N_TILE = 512
 QUANT_TOKEN_TILE = 8
 QUANT_TASK_T_TILE = 32
-PROJ_B_D_TILE = 512  # proj_b_mm D chunk per task; coarser starves the 24 AIC cores
+PROJ_B_D_TILE = 1024  # proj_b_mm D chunk per task; coarser starves the 24 AIC cores
 PROJ_B_ACT_T_TILE = 8
 PROJ_B_ACT_TASK_T_TILE = 32  # proj_b_act token block per task
 
