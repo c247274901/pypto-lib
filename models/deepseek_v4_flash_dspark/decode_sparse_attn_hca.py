@@ -86,7 +86,11 @@ ROPE_CS_T_TILE = S  # rope cos/sin row block: one request per block
 T_PAD = ((T + 16 - 1) // 16) * 16
 MERGE_WORKERS = 16
 ATTENTION_PUBLISH_WORKERS = 8
-ATTENTION_PUBLISH_T_TILE = 8
+# Keep the publish tile within the A2/A3 Vec budget.  The fused HCA packer
+# materializes two [token, O_GROUP_IN] BF16 tiles per worker; doubling this
+# from four to eight rows overflows the 188 KiB Vec limit in full-layer HCA
+# and decode-forward compilation.
+ATTENTION_PUBLISH_T_TILE = 4
 LOCAL_O_GROUPS = O_GROUPS // TP
 GROUP_T_PAD = TP * T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
