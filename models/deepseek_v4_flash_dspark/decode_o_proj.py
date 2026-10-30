@@ -355,7 +355,7 @@ def decode_o_proj_tp1(
 
 
 HC_MULT = M.hc_mult
-HC_ACT_TASK_T_TILE = 4
+HC_ACT_TASK_T_TILE = 8
 
 
 @pl.jit.inline
