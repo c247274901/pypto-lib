@@ -10,11 +10,35 @@
 
 import pypto.language as pl
 
-from .ops import N_TILE, make_quantize, make_pack_weight, make_dot, make_dequantize, make_norm, make_rope
+from .ops import (
+    N_TILE, make_quantize, make_pack_weight, make_dot,
+    make_dequantize_rope, make_dequantize_norm_quantize, make_dequantize_norm_rope,
+)
 
 
-def make_qkv_w8a8_inline(capacity, config):
-    """Build shared inline QKV compute with canonical [K,N] INT8 weights."""
+def _make_weight_preparation(width, output_width, prepacked):
+    """Select canonical packing or a resident [N/64,K,64] weight view."""
+    packed_rows = width * (output_width // N_TILE)
+    if prepacked:
+        @pl.jit.inline
+        def resident(weight: pl.Tensor[[packed_rows, N_TILE], pl.INT8]):
+            return weight
+
+        return resident
+
+    pack = make_pack_weight(width, output_width)
+
+    @pl.jit.inline
+    def prepare(weight: pl.Tensor[[width, output_width], pl.INT8]):
+        packed = pl.create_tensor([packed_rows, N_TILE], dtype=pl.INT8)
+        pack(weight, packed)
+        return packed
+
+    return prepare
+
+
+def make_qkv_w8a8_inline(capacity, config, prepacked=False):
+    """Build shared inline QKV compute with canonical or resident weights."""
     hidden = config["hidden_size"]
     latent = config["q_lora_rank"]
     heads = config["num_attention_heads"]
@@ -26,32 +50,34 @@ def make_qkv_w8a8_inline(capacity, config):
     qa_packed_rows = hidden * (latent // N_TILE)
     qb_packed_rows = latent * (query_width // N_TILE)
     kv_packed_rows = hidden * (head_dim // N_TILE)
+    qa_rows, qa_cols = (qa_packed_rows, N_TILE) if prepacked else (hidden, latent)
+    qb_rows, qb_cols = (qb_packed_rows, N_TILE) if prepacked else (latent, query_width)
+    kv_rows, kv_cols = (kv_packed_rows, N_TILE) if prepacked else (hidden, head_dim)
 
-    quant_x = make_quantize(capacity, hidden)
-    quant_q = make_quantize(capacity, latent)
-    pack_qa = make_pack_weight(hidden, latent)
-    pack_qb = make_pack_weight(latent, query_width)
-    pack_kv = make_pack_weight(hidden, head_dim)
-    dot_qa = make_dot(capacity, hidden, latent)
-    dot_qb = make_dot(capacity, latent, query_width)
-    dot_kv = make_dot(capacity, hidden, head_dim)
-    dequant_qa = make_dequantize(capacity, latent)
-    dequant_qb = make_dequantize(capacity, query_width, combine_scales=True)
-    dequant_kv = make_dequantize(capacity, head_dim)
-    norm_q = make_norm(capacity, latent, eps)
-    norm_kv = make_norm(capacity, head_dim, eps)
-    rope_q = make_rope(capacity, heads, head_dim, rope_dim)
-    rope_kv = make_rope(capacity, 1, head_dim, rope_dim)
+    projection_rows = min(capacity, 32)
+    quant_x = make_quantize(capacity, hidden, whole_row=True, early_resolve=True)
+    prepare_qa = _make_weight_preparation(hidden, latent, prepacked)
+    prepare_qb = _make_weight_preparation(latent, query_width, prepacked)
+    prepare_kv = _make_weight_preparation(hidden, head_dim, prepacked)
+    dot_qa = make_dot(capacity, hidden, latent, padded_payload=True, row_tile=projection_rows, full_k_reuse=True, early_resolve=True)
+    dot_qb = make_dot(
+        capacity, latent, query_width, padded_payload=True, column_group=26,
+        row_tile=projection_rows, full_k_reuse=True, early_resolve=True, column_stages=2,
+    )
+    dot_kv = make_dot(capacity, hidden, head_dim, padded_payload=True, row_tile=projection_rows, full_k_reuse=True, early_resolve=True)
+    latent_epilogue = make_dequantize_norm_quantize(capacity, latent, eps, early_resolve=True)
+    dequant_rope_q = make_dequantize_rope(capacity, heads, head_dim, rope_dim, row_tile=1, head_tile=32, scalar_channels=True)
+    kv_epilogue = make_dequantize_norm_rope(capacity, head_dim, rope_dim, eps)
 
     @pl.jit.inline
     def qkv_w8a8_inline(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a: pl.Tensor[[qa_rows, qa_cols], pl.INT8],
         wq_a_scale: pl.Tensor[[latent], pl.FP32],
         q_norm_weight: pl.Tensor[[latent], pl.BF16],
-        wq_b: pl.Tensor[[latent, query_width], pl.INT8],
+        wq_b: pl.Tensor[[qb_rows, qb_cols], pl.INT8],
         wq_b_scale: pl.Tensor[[query_width], pl.FP32],
-        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv: pl.Tensor[[kv_rows, kv_cols], pl.INT8],
         wkv_scale: pl.Tensor[[head_dim], pl.FP32],
         kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
         rope_cos: pl.Tensor[[capacity, pair_width], pl.FP32],
@@ -68,57 +94,48 @@ def make_qkv_w8a8_inline(capacity, config):
         x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quant_x(x, x_i8, x_scale, active)
 
-        qa_packed = pl.create_tensor([qa_packed_rows, N_TILE], dtype=pl.INT8)
-        pack_qa(wq_a, qa_packed)
-        qa_int = pl.create_tensor([capacity, latent], dtype=pl.INT32)
-        dot_qa(x_i8, qa_packed, qa_int, active)
-        qa_bf16 = pl.create_tensor([capacity, latent], dtype=pl.BF16)
-        dequant_qa(qa_int, wq_a_scale, x_scale, qa_bf16, active)
-        norm_q(qa_bf16, q_norm_weight, query_latent, active)
-
-        q_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
-        q_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-        quant_q(query_latent, q_i8, q_scale, active)
-        qb_packed = pl.create_tensor([qb_packed_rows, N_TILE], dtype=pl.INT8)
-        pack_qb(wq_b, qb_packed)
-        qb_int = pl.create_tensor([capacity, query_width], dtype=pl.INT32)
-        dot_qb(q_i8, qb_packed, qb_int, active)
-        qb_bf16 = pl.create_tensor([capacity, query_width], dtype=pl.BF16)
-        dequant_qb(qb_int, wq_b_scale, q_scale, qb_bf16, active)
-        rope_q(qb_bf16, rope_cos, rope_sin, query, active)
-
-        kv_packed = pl.create_tensor([kv_packed_rows, N_TILE], dtype=pl.INT8)
-        pack_kv(wkv, kv_packed)
+        kv_packed = prepare_kv(wkv)
         kv_int = pl.create_tensor([capacity, head_dim], dtype=pl.INT32)
         dot_kv(x_i8, kv_packed, kv_int, active)
-        kv_bf16 = pl.create_tensor([capacity, head_dim], dtype=pl.BF16)
-        dequant_kv(kv_int, wkv_scale, x_scale, kv_bf16, active)
-        kv_normalized = pl.create_tensor([capacity, head_dim], dtype=pl.BF16)
-        norm_kv(kv_bf16, kv_norm_weight, kv_normalized, active)
-        rope_kv(kv_normalized, rope_cos, rope_sin, window_kv, active)
+        kv_epilogue(kv_int, wkv_scale, x_scale, kv_norm_weight, rope_cos, rope_sin, window_kv, active)
+
+        qa_packed = prepare_qa(wq_a)
+        qa_int = pl.create_tensor([capacity, latent], dtype=pl.INT32)
+        dot_qa(x_i8, qa_packed, qa_int, active)
+        q_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
+        q_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        latent_epilogue(qa_int, wq_a_scale, x_scale, q_norm_weight, query_latent, q_i8, q_scale, active)
+        qb_packed = prepare_qb(wq_b)
+        qb_int = pl.create_tensor([capacity, query_width], dtype=pl.INT32)
+        dot_qb(q_i8, qb_packed, qb_int, active)
+        dequant_rope_q(qb_int, wq_b_scale, q_scale, rope_cos, rope_sin, query, active)
+
         return positions, query_latent, query, window_kv, cache, cache_lens
 
     return qkv_w8a8_inline
 
 
-def make_qkv_w8a8(capacity, config):
+def make_qkv_w8a8(capacity, config, prepacked=False):
     """Build the standalone JIT wrapper for shared inline QKV compute."""
     hidden = config["hidden_size"]
     latent = config["q_lora_rank"]
     head_dim = config["head_dim"]
     width = config["num_attention_heads"] * head_dim
     pairs = config["qk_rope_head_dim"] // 2
-    compute = make_qkv_w8a8_inline(capacity, config)
+    qa_rows, qa_cols = (hidden * (latent // N_TILE), N_TILE) if prepacked else (hidden, latent)
+    qb_rows, qb_cols = (latent * (width // N_TILE), N_TILE) if prepacked else (latent, width)
+    kv_rows, kv_cols = (hidden * (head_dim // N_TILE), N_TILE) if prepacked else (hidden, head_dim)
+    compute = make_qkv_w8a8_inline(capacity, config, prepacked=prepacked)
 
     @pl.jit
     def qkv_w8a8(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a: pl.Tensor[[qa_rows, qa_cols], pl.INT8],
         wq_a_scale: pl.Tensor[[latent], pl.FP32],
         q_norm_weight: pl.Tensor[[latent], pl.BF16],
-        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b: pl.Tensor[[qb_rows, qb_cols], pl.INT8],
         wq_b_scale: pl.Tensor[[width], pl.FP32],
-        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv: pl.Tensor[[kv_rows, kv_cols], pl.INT8],
         wkv_scale: pl.Tensor[[head_dim], pl.FP32],
         kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
         rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],

@@ -20,6 +20,11 @@ currently partial or accepted.
 | Deferred performance work | Whole-network execution, serving, multi-card execution, and performance tuning. Decoder operators are included for independent layer validation; whole-network serving remains outside this directory. |
 | Compatibility requirements | Preserve the frozen operators' dtypes, quantization boundaries, page layouts, request controls, source ownership, readonly inputs, inactive rows, and untouched cache regions. |
 
+The [A2 operator optimization migration](optimization-migration.md) records
+the separately validated canonical W8A8 optimizations, their bounded L0
+regression coverage, and same-environment PyPTO benchmark results. Those
+results do not extend the historical acceptance claims to other entries.
+
 ## Construction and ownership
 
 The directory exposes operators and bounded stage factories. Callers supply

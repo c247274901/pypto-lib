@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "scope": "source migration; device acceptance belongs to the frozen original independent-layer snapshots",
+  "scope": "source migration plus A2 W8A8 optimizations; original frozen independent-layer acceptance is provenance, not acceptance of modified files",
   "files": [
     {
       "file": "attention.py",
@@ -313,14 +313,18 @@
       "source": "models/deepseek_v4_1_flash/a2_w8a8/hc.py",
       "source_sha256": "5872ea3c9dcae636abf3dfcdf16bde45a734dbef772f0accc8f1fc17a8cb149d",
       "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "make_hc_pre_inline": "840fde477b249a76e8f9a55f07aa4b45b25ec34ac4c96f53b5729be88b6f12e6",
-        "make_hc_post_inline": "43ea684f523c720fb6bce0513738fc0511e61b1ef3b8fd36a9e41abe1b60dec2",
-        "make_hc": "7580a7fa1e6eb881aedb2640df23131824db88ef1706fbe2db20cd08767624b1"
+      "import_relocation": true,
+      "port_base": {
+        "migrated_sha256": "5872ea3c9dcae636abf3dfcdf16bde45a734dbef772f0accc8f1fc17a8cb149d",
+        "preserved_definition_ast_sha256": {
+          "make_hc_pre_inline": "840fde477b249a76e8f9a55f07aa4b45b25ec34ac4c96f53b5729be88b6f12e6",
+          "make_hc_post_inline": "43ea684f523c720fb6bce0513738fc0511e61b1ef3b8fd36a9e41abe1b60dec2",
+          "make_hc": "7580a7fa1e6eb881aedb2640df23131824db88ef1706fbe2db20cd08767624b1"
+        },
+        "L20_freeze_source_match": true
       },
-      "migrated_sha256": "5872ea3c9dcae636abf3dfcdf16bde45a734dbef772f0accc8f1fc17a8cb149d",
-      "L20_freeze_source_match": true,
-      "import_relocation": true
+      "optimized_sha256": "18129dc3176e51706978494e8ccc7e6bf46d454843b6a93b4bfb3dc40bc7e541",
+      "optimization": "bacea43: FP32 projection/norm fusion and collapse/post tiling"
     },
     {
       "file": "indexer.py",
@@ -420,19 +424,23 @@
       "source": "models/deepseek_v4_1_flash/a2_w8a8/moe_routed.py",
       "source_sha256": "bcb1a47a7033524a41ccaab186ce51a26e5a4c6b797bca91456f5627b434dd79",
       "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "expert_routed_tile": "d14415a1538fa4f2ba69317cf9f186e70adf2a2cd90926403fefb238668bdf48",
-        "expert_routed_test": "dd5123cee8b779ac4c163dfd47594f8ecbfbcffde71e68fff6221ab2b10bee5c",
-        "golden_expert_routed": "5fc4cc634ece997d5c4dd733ad5e1e088e29696e28067d7885937c6245810194",
-        "gen_routed_weight": "bc94de37d89bb3900b183abc4a0a1d3831f9fd38f148b7524a9b712ce9fa7069",
-        "build_tensor_specs": "d6a6f42715fe6966663e5b85dc1a4326cb32e25125fc121c59535240c405d87c"
-      },
-      "migrated_sha256": "96eb44ee29b1ece3d8542b27b2441ba6b7b62c986f1aa34ca982907039d89290",
-      "L20_freeze_source_match": true,
       "import_relocation": true,
       "host_changes": [
         "bind FLASH configuration for the standalone golden input builder"
-      ]
+      ],
+      "port_base": {
+        "migrated_sha256": "96eb44ee29b1ece3d8542b27b2441ba6b7b62c986f1aa34ca982907039d89290",
+        "preserved_definition_ast_sha256": {
+          "expert_routed_tile": "d14415a1538fa4f2ba69317cf9f186e70adf2a2cd90926403fefb238668bdf48",
+          "expert_routed_test": "dd5123cee8b779ac4c163dfd47594f8ecbfbcffde71e68fff6221ab2b10bee5c",
+          "golden_expert_routed": "5fc4cc634ece997d5c4dd733ad5e1e088e29696e28067d7885937c6245810194",
+          "gen_routed_weight": "bc94de37d89bb3900b183abc4a0a1d3831f9fd38f148b7524a9b712ce9fa7069",
+          "build_tensor_specs": "d6a6f42715fe6966663e5b85dc1a4326cb32e25125fc121c59535240c405d87c"
+        },
+        "L20_freeze_source_match": true
+      },
+      "optimized_sha256": "78583a5b6c854b5f9f28419c0618dc3bf0580ff430a0eb26ce20531ea29ffbfb",
+      "optimization": "85165da: receive/gate/down tiling only; preserve PR numerical corrections"
     },
     {
       "file": "moe_router.py",
@@ -452,45 +460,57 @@
       "source": "models/deepseek_v4_1_flash/a2_w8a8/moe_shared.py",
       "source_sha256": "ad67156ebe069ba6e17a88fcbb70345e4558ae631d1277474509d7ce9185e216",
       "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "_make_shared_activation": "1a8b70825683b9e8ccd3c8c66d3c472b3dded44fda90d904b661839f65b19153",
-        "make_shared_moe_w8a8_inline": "3e1b5bb59b011fbe51323e6665ec797e4d49f73f1651734417ef672429f8803e",
-        "make_shared_moe_w8a8": "06df31590b434f2610443e7ece9aa632da9838448baa3d0194383e0a5d91f726"
+      "import_relocation": true,
+      "port_base": {
+        "migrated_sha256": "9f96cd609a7fa09af61dea410f7860a03bf21a47273dc65657a15c1196a1d1d8",
+        "preserved_definition_ast_sha256": {
+          "_make_shared_activation": "1a8b70825683b9e8ccd3c8c66d3c472b3dded44fda90d904b661839f65b19153",
+          "make_shared_moe_w8a8_inline": "3e1b5bb59b011fbe51323e6665ec797e4d49f73f1651734417ef672429f8803e",
+          "make_shared_moe_w8a8": "06df31590b434f2610443e7ece9aa632da9838448baa3d0194383e0a5d91f726"
+        },
+        "L20_freeze_source_match": true
       },
-      "migrated_sha256": "9f96cd609a7fa09af61dea410f7860a03bf21a47273dc65657a15c1196a1d1d8",
-      "L20_freeze_source_match": true,
-      "import_relocation": true
+      "optimized_sha256": "b0f054f95d74bcfc22e6181c1b06e0be37a749070f327f2f171ea4db659c82c3",
+      "optimization": "727e423: BF16 shared expert; preserve PR fused FP32 branch"
     },
     {
       "file": "o_proj.py",
       "source": "models/deepseek_v4_1_flash/a2_w8a8/o_proj.py",
       "source_sha256": "982b44565cda23a645724aca578af5f711532c78d29db1b8dedfb3afb02ca7ae",
       "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "make_o_proj_inline": "d1cd647064a7b2bd55f85000f4a66a6cdc9e51c7d5623f22834de048dd0d14f6",
-        "make_o_proj_w8a8": "c8e6693a8afb235f12ffc15e9b2af23b792b71f2c3f93125864a3bf83d4723dd"
+      "import_relocation": true,
+      "port_base": {
+        "migrated_sha256": "507d964a3008b3f401bcaaf8c39ed6e1391d1c42a30145d9387c80349ce09bc0",
+        "preserved_definition_ast_sha256": {
+          "make_o_proj_inline": "d1cd647064a7b2bd55f85000f4a66a6cdc9e51c7d5623f22834de048dd0d14f6",
+          "make_o_proj_w8a8": "c8e6693a8afb235f12ffc15e9b2af23b792b71f2c3f93125864a3bf83d4723dd"
+        },
+        "L20_freeze_source_match": true
       },
-      "migrated_sha256": "507d964a3008b3f401bcaaf8c39ed6e1391d1c42a30145d9387c80349ce09bc0",
-      "L20_freeze_source_match": true,
-      "import_relocation": true
+      "optimized_sha256": "3e076cff3d822a93b4ec078847ffce8ce8c21cf7cffce27bf81c0a6b142f196a",
+      "optimization": "e9117ee: grouped projection and epilogue fusion, preserving PR scale order"
     },
     {
       "file": "ops.py",
       "source": "models/deepseek_v4_1_flash/a2_w8a8/ops.py",
       "source_sha256": "f44963a7c958682de7f217c29ffa69159cc7c873725830113e501a328bd330f2",
       "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "make_cast_tile": "8ebba3995b3317d11a77793d0d12b1826316b4286c33150443b4f83394bbf81b",
-        "make_quantize": "09db591bf2e661cdc494cb43c699cdd8bfabeb6e16e01bb05deb4b45dcb679e6",
-        "make_pack_weight": "f1a8a77e8959f884f0080b3708973a0916449db7164fd3e356dbb539c422118e",
-        "make_dot": "a0a21b2ad1fd66420feb60f0b2a6bbe7ff5f2a86385b03f0aeb306687be19b43",
-        "make_dequantize": "86dc3ab3a151d4b0b8fcfee7f0c1ede8628832185b0a0ab20ef4ed11ca402242",
-        "make_norm": "c93695a9bcba3fad0e518c4a8ea6d359cd04a6d6381b6caf4cc4565e6bfde16f",
-        "make_rope": "dd3886c8eddc58b29aeebb6f4ac65e3fb7f1e19e34c35efedfd78734bc720871"
+      "import_relocation": true,
+      "port_base": {
+        "migrated_sha256": "f44963a7c958682de7f217c29ffa69159cc7c873725830113e501a328bd330f2",
+        "preserved_definition_ast_sha256": {
+          "make_cast_tile": "8ebba3995b3317d11a77793d0d12b1826316b4286c33150443b4f83394bbf81b",
+          "make_quantize": "09db591bf2e661cdc494cb43c699cdd8bfabeb6e16e01bb05deb4b45dcb679e6",
+          "make_pack_weight": "f1a8a77e8959f884f0080b3708973a0916449db7164fd3e356dbb539c422118e",
+          "make_dot": "a0a21b2ad1fd66420feb60f0b2a6bbe7ff5f2a86385b03f0aeb306687be19b43",
+          "make_dequantize": "86dc3ab3a151d4b0b8fcfee7f0c1ede8628832185b0a0ab20ef4ed11ca402242",
+          "make_norm": "c93695a9bcba3fad0e518c4a8ea6d359cd04a6d6381b6caf4cc4565e6bfde16f",
+          "make_rope": "dd3886c8eddc58b29aeebb6f4ac65e3fb7f1e19e34c35efedfd78734bc720871"
+        },
+        "L20_freeze_source_match": true
       },
-      "migrated_sha256": "f44963a7c958682de7f217c29ffa69159cc7c873725830113e501a328bd330f2",
-      "L20_freeze_source_match": true,
-      "import_relocation": true
+      "optimized_sha256": "d736763b522de51aee01cbbd6603cb0194499771fae42c1d780d6e8141296831",
+      "optimization": "QKV helpers, parameterized output packing, isolated shared-expert helpers"
     },
     {
       "file": "prefill.py",
@@ -535,13 +555,17 @@
       "source": "models/deepseek_v4_1_flash/a2_w8a8/swa.py",
       "source_sha256": "cd088458daffcf442b720405108261a713b84f86a96d035afde218104526c080",
       "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "make_swa_inline": "60a0c0751f858fdae068810deb55d3684228eb1410d722307a8cc6dd01a7baa9",
-        "make_swa": "42b672bbe191f32fb3a8d89f13b03b7e67a43b358f93c46356b4e3546a6f3c0d"
+      "import_relocation": true,
+      "port_base": {
+        "migrated_sha256": "cd088458daffcf442b720405108261a713b84f86a96d035afde218104526c080",
+        "preserved_definition_ast_sha256": {
+          "make_swa_inline": "60a0c0751f858fdae068810deb55d3684228eb1410d722307a8cc6dd01a7baa9",
+          "make_swa": "42b672bbe191f32fb3a8d89f13b03b7e67a43b358f93c46356b4e3546a6f3c0d"
+        },
+        "L20_freeze_source_match": true
       },
-      "migrated_sha256": "cd088458daffcf442b720405108261a713b84f86a96d035afde218104526c080",
-      "L20_freeze_source_match": true,
-      "import_relocation": true
+      "optimized_sha256": "354ba9594f15e09d374e19f3a0835fcb6c0fdbb75a19513eaaffc535da05f83b",
+      "optimization": "840fb7c: full-head single-window attention fusion"
     },
     {
       "file": "full2_readback_runtime.py",
@@ -847,13 +871,17 @@
       "source": "models/deepseek_v4_1_flash/qkv_w8a8.py",
       "source_sha256": "5533ec1b1f85a44bfe64f952a6760d2be0210abd37bbfd301d8b959091d0f54e",
       "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "make_qkv_w8a8_inline": "d50c009059dedb50e7cc598d6ecf568a959b37b406994a4558158e6c392173eb",
-        "make_qkv_w8a8": "682e644d800df6105fcd086a8fc7c1be6ec863b50bc9f13352fcfcd4fba590aa"
+      "import_relocation": true,
+      "port_base": {
+        "migrated_sha256": "0bd7def9bbf272ff79c778273a1513d3b4c619b9630f46b5172c06ee392ca78a",
+        "preserved_definition_ast_sha256": {
+          "make_qkv_w8a8_inline": "d50c009059dedb50e7cc598d6ecf568a959b37b406994a4558158e6c392173eb",
+          "make_qkv_w8a8": "682e644d800df6105fcd086a8fc7c1be6ec863b50bc9f13352fcfcd4fba590aa"
+        },
+        "L20_freeze_source_match": true
       },
-      "migrated_sha256": "0bd7def9bbf272ff79c778273a1513d3b4c619b9630f46b5172c06ee392ca78a",
-      "L20_freeze_source_match": true,
-      "import_relocation": true
+      "optimized_sha256": "1221bc1200166fac582eb591216ebdef1546eaf2515ea250aea10669cd6b6494",
+      "optimization": "latest validated QKV fusion and scheduling; optional static prepacking"
     },
     {
       "file": "ratio1_prefill.py",
@@ -989,5 +1017,6 @@
       "reason": "Expose the A2/A3 L24 C1A reindex path under the A5 decoder filename."
     }
   ],
-  "preserved_definition_count": 153
+  "preserved_definition_count": 129,
+  "optimization_base_revision": "addb655f7b4f4a4ce56af875724a04d79d3fe325"
 }
