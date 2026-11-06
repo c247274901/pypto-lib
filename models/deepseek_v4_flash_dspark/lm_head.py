@@ -65,7 +65,7 @@ TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card
 # One whole owner per block is the widest M the Acc space admits, and it halves
 # the weight tile re-reads a narrower row tile forces.
 FUSED_K_TILE = 256
-FUSED_VOCAB_TILE = 128
+FUSED_VOCAB_TILE = 256
 MM_ROW_TILE = 128
 HIDDEN_GATHER_TILE = 1024
 HIDDEN_GATHER_ROW_TILE = min(GROUP_LOGIT_ROWS, 64)
@@ -76,11 +76,14 @@ LOGITS_COMM_TILE = 2048
 # 8 rows keeps a reduction result at 32 B; alloc_tile rejects the 4 B a [1, 1] gives.
 GREEDY_ROW_WIDTH = 808
 GREEDY_BLOCK_ROWS = 8
+GREEDY_MASK_VALID_BYTES = (GREEDY_ROW_WIDTH + 7) // 8
+GREEDY_MASK_EVEN_BYTES = (GREEDY_MASK_VALID_BYTES + 1) // 2 * 2
 SAMPLED_IDS_PAD = 8
 FUSED_LM_HEAD_CORES = 24
 # AIV lanes per AICore: the fused kernel splits each row block's accumulator
 # across the two lanes, and each lane pushes a contiguous half of one owner's rows.
 AIV_LANES = 2
+GREEDY_SAMPLE_CORES = min(MAX_LOGIT_ROWS, FUSED_LM_HEAD_CORES * AIV_LANES)
 LANE_ROWS = MM_ROW_TILE // AIV_LANES
 VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
@@ -94,6 +97,7 @@ GRAMMAR_LOOKUP_WIDTH = 816  # 808 logits plus the 32-byte int16 tile alignment.
 GRAMMAR_SEGMENT_WORDS = 64  # 808 bits plus aligned padding per scan lane.
 # 2^30: above every vocab id, clear of int32 overflow once a block base is added.
 GREEDY_INDEX_SENTINEL = 1073741824
+GREEDY_INDEX_SENTINEL_FP32 = float(GREEDY_INDEX_SENTINEL)
 DONE_VALUE = 1
 LM_HEAD_RING_HEAP = 1 << 30
 
@@ -127,7 +131,8 @@ def lm_head(
 ]:
     # Scratch is allocated just outside the scope that first writes it: a
     # create_tensor inside a pl.at yields a tile, not a GM tensor view.
-    selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
+    selected_hidden = pl.create_tensor([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+    selected_hidden_packed = pl.create_tensor([D // FUSED_K_TILE, GROUP_LOGIT_ROWS, FUSED_K_TILE], dtype=pl.BF16)
 
     # Publish this card's logit rows into every group member's window slot: the
     # window holds one slot per group member and each card writes only its own,
@@ -152,21 +157,32 @@ def lm_head(
             # caller hands over a stale index; the -1 guard below decides whether
             # the row is actually used.
             safe_raw = pl.max(pl.min(source_row_raw, hidden_rows - 1), 0)
-            selected_hidden[row : row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
-            if source_row_raw >= 0:
-                source_row = pl.cast(safe_raw, target_type=pl.INDEX)
-                selected_hidden[row : row + 1, :] = hidden_states[source_row : source_row + 1, :]
+            if TP_SIZE == 1:
+                packed_zero_row = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                packed_zero_panels = pl.reshape(packed_zero_row, [D // FUSED_K_TILE, 1, FUSED_K_TILE])
+                selected_hidden_packed[:, row : row + 1, :] = packed_zero_panels
+                if source_row_raw >= 0:
+                    packed_source_row = pl.cast(safe_raw, target_type=pl.INDEX)
+                    packed_selected_row = hidden_states[packed_source_row : packed_source_row + 1, :]
+                    packed_selected_panels = pl.reshape(packed_selected_row, [D // FUSED_K_TILE, 1, FUSED_K_TILE])
+                    selected_hidden_packed[:, row : row + 1, :] = packed_selected_panels
+            else:
+                selected_hidden[row : row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                if source_row_raw >= 0:
+                    source_row = pl.cast(safe_raw, target_type=pl.INDEX)
+                    selected_hidden[row : row + 1, :] = hidden_states[source_row : source_row + 1, :]
 
-        # Self-target rides the same put; put drains before the notify issues.
-        for peer_tp in pl.range(TP_SIZE):
-            pld.tensor.put(
-                dst=hidden_window,
-                peer=group_base + peer_tp,
-                src=selected_hidden,
-                dst_offsets=[tp_rank * MAX_LOGIT_ROWS + r0, 0],
-                src_offsets=[r0, 0],
-                shape=[PUSH_ROW_TILE, D],
-            )
+        if TP_SIZE > 1:
+            # Publish this owner's selected rows to all head shards.
+            for peer_tp in pl.range(TP_SIZE):
+                pld.tensor.put(
+                    dst=hidden_window,
+                    peer=group_base + peer_tp,
+                    src=selected_hidden,
+                    dst_offsets=[tp_rank * MAX_LOGIT_ROWS + r0, 0],
+                    src_offsets=[r0, 0],
+                    shape=[PUSH_ROW_TILE, D],
+                )
 
         # Notify folded into the push: one notify per block per source per epoch.
         for peer_tp in pl.range(TP_SIZE):
@@ -179,35 +195,33 @@ def lm_head(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Start the wait after this rank has published. Signal credits persist until
-    # the final clear, so peer notifies may safely arrive before this task starts;
-    # anchoring avoids an idle wait occupying a core group while the push is pending.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", deps=[_dispatch_push_tid]
-    ) as _dwait_tid:
-        for owner_tp in pl.range(TP_SIZE):
-            if owner_tp != tp_rank:
-                pld.system.wait(
-                    signal=hidden_done,
-                    offsets=[owner_tp, 0],
-                    expected=pl.cast(done_epoch * (MAX_LOGIT_ROWS // PUSH_ROW_TILE), pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
-                )
+    if TP_SIZE > 1:
+        # Join all published row slots before reusing the selection buffer.
+        with pl.at(
+            level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", deps=[_dispatch_push_tid]
+        ) as _dwait_tid:
+            for owner_tp in pl.range(TP_SIZE):
+                if owner_tp != tp_rank:
+                    pld.system.wait(
+                        signal=hidden_done,
+                        offsets=[owner_tp, 0],
+                        expected=pl.cast(done_epoch * (MAX_LOGIT_ROWS // PUSH_ROW_TILE), pl.INT32),
+                        cmp=pld.WaitCmp.Ge,
+                    )
 
-    # Window -> matmul operand: a local copy split over k-tiles. Keeps the matmul's
-    # auto-dep on owner_hiddens.
-    owner_hiddens = pl.create_tensor([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    with pl.spmd(
-        (GROUP_LOGIT_ROWS // HIDDEN_GATHER_ROW_TILE) * (D // HIDDEN_GATHER_TILE),
-        name_hint="lm_head_dispatch_gather",
-        deps=[_dwait_tid, _dispatch_push_tid],
-    ) as _dgather_tid:
-        gblock = pl.tile.get_block_idx()
-        gk0 = (gblock % (D // HIDDEN_GATHER_TILE)) * HIDDEN_GATHER_TILE
-        gr0 = (gblock // (D // HIDDEN_GATHER_TILE)) * HIDDEN_GATHER_ROW_TILE
-        owner_hiddens[gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[
-            gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE
-        ]
+        with pl.spmd(
+            (GROUP_LOGIT_ROWS // HIDDEN_GATHER_ROW_TILE) * (D // HIDDEN_GATHER_TILE),
+            name_hint="lm_head_dispatch_gather",
+            deps=[_dwait_tid, _dispatch_push_tid],
+        ):
+            gblock = pl.tile.get_block_idx()
+            gk0 = (gblock % (D // HIDDEN_GATHER_TILE)) * HIDDEN_GATHER_TILE
+            gr0 = (gblock // (D // HIDDEN_GATHER_TILE)) * HIDDEN_GATHER_ROW_TILE
+            selected_hidden[gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[
+                gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE
+            ]
+
+    packed_hidden_grid = pl.reshape(selected_hidden_packed, [D // FUSED_K_TILE * GROUP_LOGIT_ROWS, FUSED_K_TILE])
 
     # Fused cube+comm kernel: matmul one [MM_ROW_TILE, FUSED_VOCAB_TILE] tile,
     # carry the accumulator across the C->V edge with pl.aiv_shard, and
@@ -217,8 +231,9 @@ def lm_head(
     with pl.spmd(
         FUSED_LM_HEAD_CORES,
         name_hint="lm_head_matmul_push",
-        deps=[_dgather_tid],
-        optimizations=[pl.cross_core_slot(slot_num=2)],
+        deps=[_dispatch_push_tid],
+        allow_early_resolve=True,
+        optimizations=[pl.cross_core_slot(slot_num=2, local_slot_num=1)],
     ) as _push_tid:
         # Weight reads bypass L2.
         pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
@@ -231,20 +246,26 @@ def lm_head(
                 mm_acc = pl.create_tensor([MM_ROW_TILE, FUSED_VOCAB_TILE], dtype=pl.FP32)
                 for mm_kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                     mm_k0 = mm_kb * FUSED_K_TILE
-                    mm_hidden_tile = owner_hiddens[mm_r0 : mm_r0 + MM_ROW_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
+                    if TP_SIZE == 1:
+                        mm_packed_r0 = mm_kb * GROUP_LOGIT_ROWS + mm_r0
+                        mm_hidden_tile = packed_hidden_grid[mm_packed_r0 : mm_packed_r0 + MM_ROW_TILE, :]
+                    else:
+                        mm_hidden_tile = selected_hidden[mm_r0 : mm_r0 + MM_ROW_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
                     mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
                     mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True, init_cond=(mm_kb == 0))
 
-                # The block is one owner's rows; the two lanes push its two
-                # contiguous halves straight to that owner's window.
-                for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                    mm_shard = pl.aiv_shard(mm_acc)
-                    owner_tp = mm_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
-                    owner_r0 = (mm_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
-                    pld.tensor.remote_store(
-                        mm_shard, logits_window, group_base + owner_tp,
-                        [owner_r0, vocab_base + mm_o0],
-                    )
+                if TP_SIZE == 1:
+                    logits[mm_r0 : mm_r0 + MM_ROW_TILE, mm_o0 : mm_o0 + FUSED_VOCAB_TILE] = mm_acc
+                else:
+                    # Push each lane's contiguous rows to their owner.
+                    for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                        mm_shard = pl.aiv_shard(mm_acc)
+                        owner_tp = mm_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
+                        owner_r0 = (mm_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
+                        pld.tensor.remote_store(
+                            mm_shard, logits_window, group_base + owner_tp,
+                            [owner_r0, vocab_base + mm_o0],
+                        )
 
         # Ragged tail: its own matmul on one block; the accumulator is already
         # VOCAB_TAIL wide. Hoisted out of the strided loop: a dynamic branch would
@@ -257,7 +278,7 @@ def lm_head(
                     tail_acc = pl.create_tensor([MM_ROW_TILE, VOCAB_TAIL], dtype=pl.FP32)
                     for tail_kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
                         tail_k0 = tail_kb * FUSED_K_TILE
-                        tail_hidden_tile = owner_hiddens[
+                        tail_hidden_tile = selected_hidden[
                             tail_r0 : tail_r0 + MM_ROW_TILE, tail_k0 : tail_k0 + FUSED_K_TILE
                         ]
                         tail_weight_tile = lm_head_weight[
@@ -266,14 +287,17 @@ def lm_head(
                         ]
                         tail_acc = pl.matmul_acc(tail_acc, tail_hidden_tile, tail_weight_tile, b_trans=True, init_cond=(tail_kb == 0))
 
-                    for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                        tail_shard = pl.aiv_shard(tail_acc)
-                        owner_tp = tail_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
-                        owner_r0 = (tail_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
-                        pld.tensor.remote_store(
-                            tail_shard, logits_window, group_base + owner_tp,
-                            [owner_r0, vocab_base + mm_tail_o0],
-                        )
+                    if TP_SIZE == 1:
+                        logits[tail_r0 : tail_r0 + MM_ROW_TILE, mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL] = tail_acc
+                    else:
+                        for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                            tail_shard = pl.aiv_shard(tail_acc)
+                            owner_tp = tail_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
+                            owner_r0 = (tail_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
+                            pld.tensor.remote_store(
+                                tail_shard, logits_window, group_base + owner_tp,
+                                [owner_r0, vocab_base + mm_tail_o0],
+                            )
 
         # Notify folded into the push: each block signals every peer after its own
         # stores, so a peer sees FUSED_LM_HEAD_CORES notifies per source per epoch.
@@ -289,54 +313,51 @@ def lm_head(
                         op=pld.NotifyOp.AtomicAdd,
                     )
 
-    # Wait only (the notify rides inside the push). deps on the push scope so the
-    # wait runs alongside our own push; an unanchored wait dispatches immediately
-    # and spins holding a core group.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid]
-    ) as _cwait_tid:
-        for src_tp in pl.range(TP_SIZE):
-            if src_tp != tp_rank:
-                pld.system.wait(
-                    signal=logits_done,
-                    offsets=[src_tp, 0],
-                    expected=pl.cast(done_epoch * FUSED_LM_HEAD_CORES, pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
-                )
+    if TP_SIZE > 1:
+        # Wait for every peer vocabulary shard.
+        with pl.at(
+            level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid]
+        ) as _cwait_tid:
+            for src_tp in pl.range(TP_SIZE):
+                if src_tp != tp_rank:
+                    pld.system.wait(
+                        signal=logits_done,
+                        offsets=[src_tp, 0],
+                        expected=pl.cast(done_epoch * FUSED_LM_HEAD_CORES, pl.INT32),
+                        cmp=pld.WaitCmp.Ge,
+                    )
 
-    # Assemble full-vocabulary logits, same vocab-tile split. deps on _cwait_tid for
-    # the peers' stores; our own tiles ride the local RAW edge on logits_window.
-    with pl.spmd(
-        LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_gather", deps=[_cwait_tid]
-    ) as _gather_tid:
-        gblk = pl.tile.get_block_idx()
-        for src_tp in pl.range(TP_SIZE):
-            src_vocab_base = src_tp * VOCAB_PER_TP
-            for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
-                o0 = ob * LOGITS_COMM_TILE
-                lo = src_vocab_base + o0
-                for gr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                    logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window[
-                        gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE
-                    ]
-
-            if LOGITS_COMM_TAIL != 0:
-                if gblk == LOGITS_TAIL_BLOCK:
-                    tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
-                    tl = src_vocab_base + tail_o0
-                    for tr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
-                        logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window[
-                            tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL
+        # Assemble full-vocabulary logits from the group-local window.
+        with pl.spmd(
+            LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_gather", deps=[_cwait_tid]
+        ):
+            gblk = pl.tile.get_block_idx()
+            for src_tp in pl.range(TP_SIZE):
+                src_vocab_base = src_tp * VOCAB_PER_TP
+                for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
+                    o0 = ob * LOGITS_COMM_TILE
+                    lo = src_vocab_base + o0
+                    for gr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                        logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window[
+                            gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE
                         ]
 
-    # Every local wait has observed all current-round peer notifies before the
-    # logits gather can complete. Clear only this rank's counters so a retained
-    # CommDomain can safely reuse the fixed done_epoch on the next forward.
+                if LOGITS_COMM_TAIL != 0:
+                    if gblk == LOGITS_TAIL_BLOCK:
+                        tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
+                        tl = src_vocab_base + tail_o0
+                        for tr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                            logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window[
+                                tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL
+                            ]
+
+    # The logits read joins the final writer before clearing local counters.
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="lm_head_signal_clear",
-        deps=[_gather_tid],
+        deps=[_push_tid],
     ) as _clear_tid:
+        _logits_anchor = pl.read(logits, [0, 0])
         zero = pl.cast(0, pl.INT32)
         for src_tp in pl.range(TP_SIZE):
             pl.write(hidden_done, [src_tp, 0], zero)
@@ -390,124 +411,110 @@ def greedy_sample(
     # The inactive-row mask rides the same block: a dead row skips the scan
     # instead of being overwritten by a second pass over sampled_ids.
     logits_grid = pl.reshape(logits, [MAX_LOGIT_ROWS * GREEDY_GRID_ROWS, GREEDY_ROW_WIDTH])
-    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_greedy_sample"):
-        if pl.read(logit_row_indices, [row]) < 0:
-            sampled_ids[row : row + 1, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
-        else:
-            # The last padding word of segment zero is a row-mode header.
-            # -1 selects the native argmax without reading or expanding mask bits.
-            if pl.read(grammar_mask, [row, 0, GRAMMAR_SEGMENT_WORDS - 1]) == -1:
-                row_base = row * GREEDY_GRID_ROWS
-                running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
-                running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
-                for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
-                    block_row = row_base + block * GREEDY_BLOCK_ROWS
-                    scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
-                    # Strict greater-than, so a lane keeps the earliest block it peaked at.
-                    is_newer = pl.cmp(scores, running_max, cmp_type=4)
-                    newer = pl.cast(is_newer, target_type=pl.INT32)
-                    running_max = pl.maximum(running_max, scores)
-                    block_base = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
-                    to_new = pl.neg(pl.sub(running_base, block_base))
-                    running_base = pl.add(running_base, pl.mul(newer, to_new))
-
-                # Broadcast the lane maxima back and column-reduce: every entry is then the
-                # row maximum. A scalar pl.max over the lanes miscompiles on fp32
-                # (ptoas_bitcast has no float overload).
-                lane_maxima = pl.row_max(running_max)
-                lane_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0)
-                lane_broadcast = pl.row_expand_add(lane_zeros, lane_maxima)
-                best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
-
-                # Flat index of every lane still at the row maximum, sentinel for the rest.
-                # The lane * width term folds into the scalar combine below, keeping the
-                # ramp a broadcast row rather than an (illegal) 2D arange.
-                ramp_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
-                column_ramp = pl.col_expand(ramp_zeros, pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32))
-                flat_index = pl.add(running_base, column_ramp)
-                is_max = pl.cmp(running_max, best_value, cmp_type=0)
-                hit = pl.cast(is_max, target_type=pl.INT32)
-                offset_index = pl.sub(flat_index, GREEDY_INDEX_SENTINEL)
-                candidates = pl.add(pl.mul(hit, offset_index), GREEDY_INDEX_SENTINEL)
-                lane_indices = pl.row_min(candidates)
-                best_index = pl.read(lane_indices, [0, 0])
-                for lane in pl.range(1, GREEDY_BLOCK_ROWS):
-                    lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
-                    lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
-                    best_index = pl.min(best_index, lane_best)
-
+    grammar_grid = pl.reshape(grammar_mask, [MAX_LOGIT_ROWS * GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS])
+    for sample_worker in pl.spmd(GREEDY_SAMPLE_CORES, name_hint="lm_head_greedy_sample"):
+        for row in pl.range(sample_worker, MAX_LOGIT_ROWS, GREEDY_SAMPLE_CORES):
+            if pl.read(logit_row_indices, [row]) < 0:
+                sampled_ids[row : row + 1, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
             else:
-                row_base = row * GREEDY_GRID_ROWS
-                token_ids = pl.col_expand(
-                    pl.full([GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH], dtype=pl.INT32, value=0),
-                    pl.arange(0, [1, GRAMMAR_LOOKUP_WIDTH], dtype=pl.INT32),
-                )
-                word_indices = pl.shr(token_ids, 4)
-                bit_indices = pl.sub(token_ids, pl.mul(word_indices, 16))
-                # Build the 16 bit selectors once, including signed INT16 bit 15.
-                bit_basis = pl.shr(
-                    pl.full([1, 16], dtype=pl.INT32, value=32768),
-                    pl.sub(
-                        pl.full([1, 16], dtype=pl.INT32, value=15),
-                        pl.arange(0, [1, 16], dtype=pl.INT32),
-                    ),
-                )
-                pl.write(bit_basis, [0, 15], pl.cast(-32768, pl.INT32))
-                bit_basis_rows = pl.col_expand(
-                    pl.full([GREEDY_BLOCK_ROWS, 16], dtype=pl.INT16, value=0),
-                    pl.cast(bit_basis, pl.INT16),
-                )
-                bit_selectors = pl.gather(bit_basis_rows, dim=-1, index=bit_indices)
-                running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
-                running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
-                for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
-                    block_row = row_base + block * GREEDY_BLOCK_ROWS
-                    scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
-                    mask_words = pl.gather(
-                        grammar_mask[row, block * GREEDY_BLOCK_ROWS : (block + 1) * GREEDY_BLOCK_ROWS, :],
-                        dim=-1,
-                        index=word_indices,
-                    )
-                    bits = pl.and_(mask_words, bit_selectors)
-                    # Compare signed bit values numerically, including INT16 bit 15.
-                    forbidden = pl.cmp(pl.cast(bits, pl.FP32), 0.0, cmp_type=0)
-                    masked_scores = pl.create_tensor([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32)
-                    masked_scores[:, :] = pl.add(
-                        scores, pl.mul(forbidden[:, 0:GREEDY_ROW_WIDTH], -1.0e30)
-                    )
-                    newer = pl.cast(pl.cmp(masked_scores, running_max, cmp_type=4), target_type=pl.INT32)
-                    running_max = pl.maximum(running_max, masked_scores)
-                    block_base = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
-                    to_new = pl.neg(pl.sub(running_base, block_base))
-                    running_base = pl.add(running_base, pl.mul(newer, to_new))
+                # The last padding word of segment zero is a row-mode header.
+                # -1 selects the native argmax without reading or expanding mask bits.
+                if pl.read(grammar_mask, [row, 0, GRAMMAR_SEGMENT_WORDS - 1]) == -1:
+                    row_base = row * GREEDY_GRID_ROWS
+                    max_tile = pl.tile.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], pl.FP32, FP32_NEG_INF)
+                    base_tile = pl.tile.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], pl.INT32, 0)
+                    for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
+                        block_row = row_base + block * GREEDY_BLOCK_ROWS
+                        scores_tile = pl.tile.load(logits_grid, [block_row, 0], [GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH])
+                        # Strict greater-than retains the earliest block for each lane.
+                        newer_tile = pl.tile.cmp(scores_tile, max_tile, cmp_type=4)
+                        max_tile = pl.maximum(max_tile, scores_tile)
+                        block_base_i32 = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
+                        newer_native_full = pl.set_validshape(newer_tile, GREEDY_BLOCK_ROWS, GREEDY_MASK_EVEN_BYTES)
+                        for native_mask_row in pl.unroll(GREEDY_BLOCK_ROWS):
+                            pl.write(newer_native_full, [native_mask_row, GREEDY_MASK_VALID_BYTES], pl.cast(0, pl.UINT8))
+                        newer_native_i16 = pl.reinterpret_view(newer_native_full, pl.INT16)
+                        retain_native = pl.tile.not_(newer_native_i16)
+                        native_select_scratch = pl.tile.create([1, GREEDY_ROW_WIDTH], pl.INT32)
+                        base_tile = pl.tile.sels(retain_native, base_tile, native_select_scratch, block_base_i32)
 
-                lane_maxima = pl.row_max(running_max)
-                lane_broadcast = pl.row_expand_add(
-                    pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0),
-                    lane_maxima,
-                )
-                best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
-                column_ramp = pl.col_expand(
-                    pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0),
-                    pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32),
-                )
-                flat_index = pl.add(running_base, column_ramp)
-                hit = pl.cast(pl.cmp(running_max, best_value, cmp_type=0), target_type=pl.INT32)
-                candidates = pl.add(
-                    pl.mul(hit, pl.sub(flat_index, GREEDY_INDEX_SENTINEL)),
-                    GREEDY_INDEX_SENTINEL,
-                )
-                lane_indices = pl.row_min(candidates)
-                best_index = pl.read(lane_indices, [0, 0])
-                for lane in pl.range(1, GREEDY_BLOCK_ROWS):
-                    lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
-                    lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
-                    best_index = pl.min(best_index, lane_best)
+                    max_scratch = pl.tile.create([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], pl.FP32)
+                    maxima_tile = pl.row_max(max_tile, max_scratch)
+                    broadcast_zeros = pl.tile.full([GREEDY_BLOCK_ROWS, SAMPLED_IDS_PAD], pl.FP32, 0.0)
+                    broadcast_tile = pl.row_expand_add(broadcast_zeros, maxima_tile)
+                    best_value_tile = pl.read(pl.col_max(broadcast_tile), [0, 0])
+                    ramp_tile = pl.tile.arange(0, [1, GREEDY_ROW_WIDTH], pl.INT32)
+                    columns_tile = pl.col_expand(base_tile, ramp_tile)
+                    indices_tile = pl.add(base_tile, columns_tile)
+                    indices_f32 = pl.cast(indices_tile, pl.FP32)
+                    hits_tile = pl.tile.cmps(max_tile, best_value_tile, cmp_type=0)
+                    candidates_tile = pl.tile.select(hits_tile, indices_f32, GREEDY_INDEX_SENTINEL_FP32)
+                    min_scratch = pl.tile.create([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], pl.FP32)
+                    lane_min_f32 = pl.row_min(candidates_tile, min_scratch)
+                    lane_indices_tile = pl.cast(lane_min_f32, pl.INT32)
+                    best_index = pl.read(lane_indices_tile, [0, 0])
+                    for lane in pl.range(1, GREEDY_BLOCK_ROWS):
+                        lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
+                        lane_best = pl.read(lane_indices_tile, [lane, 0]) + lane_term
+                        best_index = pl.min(best_index, lane_best)
 
-            sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
-            sampled_row[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
-            pl.write(sampled_row, [0, 0], best_index)
-            sampled_ids[row : row + 1, :] = sampled_row
+                else:
+                    row_base = row * GREEDY_GRID_ROWS
+                    grammar_max = pl.tile.full([GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH], pl.FP32, FP32_NEG_INF)
+                    grammar_max = pl.set_validshape(grammar_max, GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH)
+                    grammar_block = pl.tile.full([GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH], pl.INT16, 0)
+                    grammar_block = pl.set_validshape(grammar_block, GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH)
+                    for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
+                        block_row = row_base + block * GREEDY_BLOCK_ROWS
+                        words_tile = pl.tile.load(grammar_grid, [block_row, 0], [GREEDY_BLOCK_ROWS, GRAMMAR_SEGMENT_WORDS])
+                        grammar_scores = pl.tile.load(
+                            logits_grid, [block_row, 0], [GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH],
+                            valid_shape=[GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH],
+                        )
+                        penalized_scores = pl.add(grammar_scores, -1.0e30)
+                        # Each 128-byte grammar row is the packed token predicate.
+                        grammar_mask_scratch = pl.tile.create([1, 16], pl.UINT32)
+                        masked_scores = pl.tile.sel(words_tile, grammar_scores, penalized_scores, grammar_mask_scratch)
+                        newer = pl.tile.cmp(masked_scores, grammar_max, cmp_type=4)
+                        grammar_max = pl.maximum(grammar_max, masked_scores)
+                        block_i16 = pl.cast(pl.cast(block, pl.INT32), pl.INT16)
+                        newer_grammar_full = pl.set_validshape(newer, GREEDY_BLOCK_ROWS, GREEDY_MASK_EVEN_BYTES)
+                        for grammar_mask_row in pl.unroll(GREEDY_BLOCK_ROWS):
+                            pl.write(newer_grammar_full, [grammar_mask_row, GREEDY_MASK_VALID_BYTES], pl.cast(0, pl.UINT8))
+                        newer_grammar_i16 = pl.reinterpret_view(newer_grammar_full, pl.INT16)
+                        retain_grammar = pl.tile.not_(newer_grammar_i16)
+                        grammar_select_scratch = pl.tile.create([1, GRAMMAR_LOOKUP_WIDTH], pl.INT16)
+                        grammar_block = pl.tile.sels(retain_grammar, grammar_block, grammar_select_scratch, block_i16)
+
+                    grammar_max_scratch = pl.tile.create([GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH], pl.FP32)
+                    lane_maxima = pl.row_max(grammar_max, grammar_max_scratch)
+                    lane_zeros = pl.tile.full([GREEDY_BLOCK_ROWS, SAMPLED_IDS_PAD], pl.FP32, 0.0)
+                    lane_broadcast = pl.row_expand_add(lane_zeros, lane_maxima)
+                    best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
+                    block_f32 = pl.cast(grammar_block, pl.FP32)
+                    base_i32 = pl.mul(pl.cast(block_f32, pl.INT32), GREEDY_BLOCK_SPAN)
+                    final_columns = pl.tile.arange(0, [1, GRAMMAR_LOOKUP_WIDTH], pl.INT32)
+                    final_columns = pl.set_validshape(final_columns, 1, GREEDY_ROW_WIDTH)
+                    final_shape = pl.tile.create([GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH], pl.INT32)
+                    final_shape = pl.set_validshape(final_shape, GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH)
+                    final_column_grid = pl.col_expand(final_shape, final_columns)
+                    flat_index = pl.add(base_i32, final_column_grid)
+                    flat_index_f32 = pl.cast(flat_index, pl.FP32)
+                    hit = pl.tile.cmps(grammar_max, best_value, cmp_type=0)
+                    candidates = pl.tile.select(hit, flat_index_f32, GREEDY_INDEX_SENTINEL_FP32)
+                    grammar_min_scratch = pl.tile.create([GREEDY_BLOCK_ROWS, GRAMMAR_LOOKUP_WIDTH], pl.FP32)
+                    grammar_lane_min_f32 = pl.row_min(candidates, grammar_min_scratch)
+                    lane_indices = pl.cast(grammar_lane_min_f32, pl.INT32)
+                    best_index = pl.read(lane_indices, [0, 0])
+                    for lane in pl.range(1, GREEDY_BLOCK_ROWS):
+                        lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
+                        lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
+                        best_index = pl.min(best_index, lane_best)
+
+                sampled_row = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
+                sampled_row[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+                pl.write(sampled_row, [0, 0], best_index)
+                sampled_ids[row : row + 1, :] = sampled_row
 
     return sampled_ids
 
