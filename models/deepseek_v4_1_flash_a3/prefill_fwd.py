@@ -27,6 +27,8 @@ def run_prefill(inputs, *, weights, cache, config, devices, output, continuation
     ``inputs`` contains the backbone input tensors and input contract.
     ``cache`` supplies the canonical all-rank cache ABI, source descriptors and
     Engram contracts. No historical task release or layer receipt is required.
+    ``continuation`` accepts one prepared chunk or a lazy iterable of chunks;
+    each chunk follows the preceding input's hash and next epoch.
     """
     from .runtime_config import configure_devices
 
@@ -53,11 +55,43 @@ def load_configuration(path):
     for name in ("checkpoint", "inputs", "cache_state", "contract", "output"):
         value = Path(settings[name])
         settings[name] = value if value.is_absolute() else (path.parent / value).resolve()
+    chunks = settings.get("continuations", [])
+    if not isinstance(chunks, list):
+        raise ValueError("continuations must be a list of prepared chunk descriptors")
+    for chunk in chunks:
+        if not isinstance(chunk, dict) or not {"inputs", "contract", "metadata_sources"} <= chunk.keys():
+            raise ValueError("Each continuation needs inputs, contract and metadata_sources paths")
+        for name in ("inputs", "contract", "metadata_sources"):
+            if not isinstance(chunk[name], str) or not chunk[name]:
+                raise ValueError("Continuation paths must be nonempty strings")
+            value = Path(chunk[name])
+            chunk[name] = value if value.is_absolute() else (path.parent / value).resolve()
     devices = settings["devices"]
     if (not isinstance(devices, list) or len(devices) != 16 or
             any(type(value) is not int or value < 0 for value in devices) or len(set(devices)) != 16):
         raise ValueError("The current full-network configuration requires 16 distinct physical device IDs")
     return settings
+
+
+def load_continuations(chunks):
+    """Load each prepared chunk and its rank metadata descriptors on demand."""
+    import torch
+
+    for chunk in chunks:
+        metadata_path = Path(chunk["metadata_sources"])
+        sources = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(sources, list) or len(sources) != 16:
+            raise ValueError("Continuation metadata_sources must describe all 16 ranks")
+        for rank, source in enumerate(sources):
+            if not isinstance(source, dict) or not {"rank", "path", "sha256"} <= source.keys():
+                raise ValueError("Each continuation metadata source needs rank, path and sha256")
+            if type(source["rank"]) is not int or source["rank"] != rank:
+                raise ValueError("Continuation metadata sources must retain rank order")
+            value = Path(source["path"])
+            source["path"] = str(value if value.is_absolute() else (metadata_path.parent / value).resolve())
+        inputs = torch.load(chunk["inputs"], map_location="cpu", weights_only=True)
+        contract = json.loads(Path(chunk["contract"]).read_text(encoding="utf-8"))
+        yield dict(inputs=inputs, contract=contract, metadata_sources=sources)
 
 
 def main():
@@ -90,8 +124,9 @@ def main():
     contract = json.loads(settings["contract"].read_text(encoding="utf-8"))
     inputs = torch.load(settings["inputs"], map_location="cpu", weights_only=True)
     cache = torch.load(settings["cache_state"], map_location="cpu", weights_only=True)
+    continuation = load_continuations(settings["continuations"]) if settings.get("continuations") else None
     run_prefill(inputs, weights=settings["checkpoint"], cache=cache, config=contract,
-                devices=settings["devices"], output=settings["output"])
+                devices=settings["devices"], output=settings["output"], continuation=continuation)
 
 
 if __name__ == "__main__":

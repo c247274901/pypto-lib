@@ -183,10 +183,280 @@ def check_runtime_configuration():
                 inherited_environment="not_required", conflicting_mapping="rejected_without_mutation")
 
 
+def check_chunk_continuation():
+    """Exercise the actual chunk runner with HOST substitutes for NPU execution and allocations."""
+    from collections.abc import Mapping
+    from contextlib import ExitStack
+    from copy import deepcopy
+    import hashlib
+    import os
+    import sys
+    from tempfile import TemporaryDirectory
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import patch
+
+    from . import prefill_fwd
+
+    source = ast.parse((ROOT / "prefill_network_runtime.py").read_text(encoding="utf-8"))
+    runner = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "run_network_runtime")
+    code = compile(ast.Module(body=[runner], type_ignores=[]), "prefill_network_runtime.py", "exec")
+    topology = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
+    modes = dict(real_w8a8=True)
+    fixtures = 0
+    rejected = 0
+
+    def sha(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def write(path, value):
+        Path(path).write_text(json.dumps(value), encoding="utf-8")
+
+    with TemporaryDirectory(prefix="a3-prefill-chunks-") as temporary:
+        root = Path(temporary)
+
+        def exercise(*, count=4, legacy=False, empty=False, change=None, fail_epoch=None,
+                     corrupt_admission=False, checkpoint=None):
+            nonlocal fixtures
+            fixtures += 1
+            directory = root / str(fixtures)
+            directory.mkdir()
+            packets, predecessor = [], None
+            for epoch in range(count):
+                actual_input = dict(epoch=epoch, predecessor_input_sha256=predecessor,
+                    tokens=list(range(epoch * 16, (epoch + 1) * 16)), history=list(range(epoch * 16)))
+                input_path = directory / f"input-{epoch}.json"
+                write(input_path, actual_input)
+                contract = dict(topology=deepcopy(topology), checkpoint="original-checkpoint", model_config={},
+                    required_modes=deepcopy(modes), capacity=16, scheduler_capacity=8192,
+                    fresh_shared_initialization={"topk_indices": -1}, input_contract_path=str(input_path),
+                    input_contract_sha256=sha(input_path))
+                predecessor = contract["input_contract_sha256"]
+                sources = []
+                for rank in range(16):
+                    path = directory / f"metadata-{epoch}-{rank}.json"
+                    write(path, dict(rank=rank, epoch=epoch))
+                    sources.append(dict(rank=rank, path=str(path), sha256=sha(path)))
+                packets.append(dict(inputs={"input_contract": actual_input}, contract=contract,
+                                    metadata_sources=sources))
+            if change is not None:
+                change(packets)
+                for packet in packets:
+                    path = packet["contract"]["input_contract_path"]
+                    write(path, packet["inputs"]["input_contract"])
+                    packet["contract"]["input_contract_sha256"] = sha(path)
+            observed = dict(completed=[], consumed=[], providers=[], weights=[], continuity=[], outputs=[])
+
+            class Provider:
+                def __init__(self, *args, **kwargs):
+                    self.shared = [{"fresh": {"topk_indices": SimpleNamespace(fill_=lambda value: None)}}]
+                    self.kv, self.history, self.finished = bytearray(), [], -1
+                    observed["providers"].append(self)
+
+                def require_network_geometry(self):
+                    return None
+
+                def begin_chunk(self, *, epoch, token_map_id, **kwargs):
+                    require(epoch == self.finished + 1, "A chunk advanced before preceding execution completed")
+                    if epoch:
+                        actual = kwargs["input_by_case"]["fresh"]
+                        require(actual["history"] == self.history, "Continuation lost the committed token history")
+                        metadata = kwargs["metadata_by_case"]["fresh"]
+                        require([row["rank"] for row in metadata] == list(range(16)), "Metadata lost rank order")
+                        require(all(row["epoch"] == epoch for row in metadata), "Continuation reused stale metadata")
+                        if corrupt_admission:
+                            self.kv.append(255)
+
+            class Weights:
+                def __init__(self, path, topology, model_config):
+                    self.path, self.releases = path, 0
+                    self.layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"])
+                    observed["weights"].append(self)
+
+                def release_current(self):
+                    self.releases += 1
+
+            def snapshot(provider, storage):
+                return dict(kv_owner=id(provider.kv), kv=provider.kv.hex(), history_owner=id(provider.history),
+                    history=list(provider.history), table_owner=id(storage), tables=list(storage or {}))
+
+            def run_chunk(inputs, **kwargs):
+                epoch, provider = kwargs["epoch"], kwargs["provider"]
+                if epoch == fail_epoch:
+                    raise RuntimeError("Injected device execution failure")
+                require(kwargs["weights"] is observed["weights"][0], "Chunk replaced the weight provider")
+                storage = kwargs["table_storage"]
+                if epoch and storage is not None:
+                    require("retained-engram" in storage, "Chunk lost the retained Engram table")
+                if storage is not None:
+                    storage["retained-engram"] = True
+                provider.kv.append(epoch)
+                provider.history.extend(inputs["input_contract"]["tokens"])
+                provider.finished = epoch
+                observed["completed"].append(epoch)
+                observed["outputs"].append(kwargs["output"].name)
+                return dict(epoch=epoch)
+
+            def write_result(path, value):
+                observed["continuity"].append(value)
+                write(path, value)
+
+            def continuations():
+                for epoch, packet in enumerate(packets[1:], start=1):
+                    require(observed["completed"] == list(range(epoch)), "The stream loaded a future chunk early")
+                    observed["consumed"].append(epoch)
+                    yield packet
+
+            namespace = dict(__package__=__package__, Mapping=Mapping, ExitStack=ExitStack, Path=Path, json=json,
+                NetworkWeights=Weights, NetworkCacheProvider=Provider, file_sha=sha,
+                attach_network_cache_geometry=lambda provider: None, _network_owner_snapshot=snapshot,
+                _run_network_chunk=run_chunk, write_json=write_result,
+                torch=SimpleNamespace(load=lambda path, **kwargs: json.loads(Path(path).read_text())))
+            exec(code, namespace)
+            module = ModuleType(__package__ + ".prefill_network_runtime")
+            module.run_network_runtime = namespace["run_network_runtime"]
+            transport = ModuleType(__package__ + ".moe_transport")
+            transport.CANNMemory = SimpleNamespace
+            cache = dict(cache_ABI=[], cache_ABI_sources=[],
+                engram_contracts={layer: dict(topology=topology, engram_shards=[0] * 4) for layer in (1, 14)})
+            continuation = packets[1] if legacy else continuations()
+            if count == 1:
+                continuation = [] if empty else None
+            modules = {module.__name__: module, transport.__name__: transport}
+            try:
+                with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, modules):
+                    result = prefill_fwd.run_prefill(packets[0]["inputs"], weights=checkpoint or "original-checkpoint",
+                        cache=cache, config=packets[0]["contract"], devices=list(range(16)),
+                        output=directory / "output", continuation=continuation)
+                expected = list(range(2 if legacy else count))
+                require(observed["completed"] == expected, "Chunk execution was skipped or duplicated")
+                require(result["epoch"] == expected[-1], "Result does not describe the last completed chunk")
+                if len(expected) > 1:
+                    require([row["epoch"] for row in result["completed_prefill_chunks"]] == expected,
+                            "The aggregate omitted completed chunks")
+                    require(observed["outputs"][1:] == [f"continuation-chunk{epoch}" for epoch in expected[1:]],
+                            "Continuation output directories collided")
+                require(all(row["before"] == row["after"] and row["exact"] for row in observed["continuity"]),
+                        "Chunk admission changed persistent state")
+                require(observed["providers"][0].history == list(range(len(expected) * 16)),
+                        "Final history does not contain the complete token stream")
+                return observed
+            finally:
+                require(len(observed["providers"]) == len(observed["weights"]) == 1,
+                        "Chunks replaced session providers")
+                require(observed["weights"][0].releases == 1, "Session cleanup was skipped or repeated")
+                exercise.observed = observed
+
+        exercise()
+        exercise(count=2, legacy=True)
+        exercise(count=1)
+        exercise(count=1, empty=True)
+        overridden = exercise(checkpoint="replacement-checkpoint")
+        require(overridden["weights"][0].path == str(Path("replacement-checkpoint").resolve()),
+                "Checkpoint override was not propagated to continuations")
+
+        def wrong_predecessor(packets):
+            packets[2]["inputs"]["input_contract"]["predecessor_input_sha256"] = packets[0]["contract"]["input_contract_sha256"]
+
+        def skipped_epoch(packets):
+            packets[2]["inputs"]["input_contract"]["epoch"] = 3
+
+        def boolean_epoch(packets):
+            packets[1]["inputs"]["input_contract"]["epoch"] = True
+
+        def changed_capacity(packets):
+            packets[2]["contract"]["capacity"] = 32
+
+        def missing_rank(packets):
+            packets[2]["metadata_sources"].pop()
+
+        def changed_metadata(packets):
+            write(packets[2]["metadata_sources"][0]["path"], {"tampered": True})
+
+        def boolean_rank(packets):
+            packets[2]["metadata_sources"][1]["rank"] = True
+
+        def incomplete_contract(packets):
+            del packets[2]["contract"]["model_config"]
+
+        def malformed_source(packets):
+            del packets[2]["metadata_sources"][0]["sha256"]
+
+        changes = (wrong_predecessor, skipped_epoch, boolean_epoch, changed_capacity, missing_rank,
+                   changed_metadata, boolean_rank, incomplete_contract, malformed_source)
+        for change in changes:
+            _reject(lambda change=change: exercise(change=change), "Invalid continuation was admitted")
+            expected = [0] if change is boolean_epoch else [0, 1]
+            require(exercise.observed["completed"] == expected, "Invalid continuation failed at the wrong boundary")
+            rejected += 1
+        _reject(lambda: exercise(corrupt_admission=True), "Admission changed cache bytes without rejection")
+        require(exercise.observed["completed"] == [0], "Execution used corrupted persistent state")
+        _reject(lambda: exercise(fail_epoch=1), "Device execution failure was ignored")
+        require(exercise.observed["completed"] == [0] and exercise.observed["consumed"] == [1],
+                "The stream advanced after failed execution")
+        rejected += 2
+    return dict(chunks=4, total_tokens=64, legacy_two_chunks="preserved", session_owners="preserved",
+                lazy_stream="checked", rejected_controls=rejected, device_execution="stubbed_not_validated")
+
+
+def check_chunk_configuration():
+    """Check CLI chunk descriptors and lazy tensor loading without Torch or device imports."""
+    import sys
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from . import prefill_fwd
+
+    with TemporaryDirectory(prefix="a3-prefill-config-") as temporary:
+        root = Path(temporary)
+        metadata_dir = root / "metadata"
+        metadata_dir.mkdir()
+        sources = [dict(rank=rank, path=f"rank-{rank}.pt", sha256="captured-identity") for rank in range(16)]
+        metadata_path = metadata_dir / "sources.json"
+        metadata_path.write_text(json.dumps(sources), encoding="utf-8")
+        (root / "contract.json").write_text("{}", encoding="utf-8")
+        descriptor = dict(inputs="chunk-inputs.pt", contract="contract.json", metadata_sources="metadata/sources.json")
+        settings = dict(checkpoint="checkpoint", inputs="inputs.pt", cache_state="cache.pt", contract="contract.json",
+                        devices=list(range(16)), output="output", continuations=[descriptor] * 2)
+        config_path = root / "prefill.json"
+        config_path.write_text(json.dumps(settings), encoding="utf-8")
+        resolved = prefill_fwd.load_configuration(config_path)
+        require(resolved["checkpoint"] == root / "checkpoint", "Checkpoint path lost its configuration base")
+        require(all(chunk["inputs"] == root / "chunk-inputs.pt" for chunk in resolved["continuations"]),
+                "Continuation paths lost their configuration base")
+        loaded = []
+
+        def load(path, *, map_location, weights_only):
+            require(map_location == "cpu" and weights_only is True, "Chunk loader changed tensor safety controls")
+            loaded.append(path)
+            return {"input_contract": {"epoch": len(loaded)}}
+
+        with patch.dict(sys.modules, {"torch": SimpleNamespace(load=load)}):
+            chunks = prefill_fwd.load_continuations(resolved["continuations"])
+            require(not loaded, "Chunk descriptors eagerly loaded tensors")
+            first = next(chunks)
+            require(len(loaded) == 1, "Loading one continuation prefetched a future chunk")
+            require(first["metadata_sources"][0]["path"] == str(metadata_dir / "rank-0.pt"),
+                    "Metadata paths lost their descriptor base")
+            require(next(chunks)["inputs"]["input_contract"]["epoch"] == 2, "Second continuation was not loaded")
+            sources[1]["rank"] = True
+            metadata_path.write_text(json.dumps(sources), encoding="utf-8")
+            _reject(lambda: next(prefill_fwd.load_continuations(resolved["continuations"])),
+                    "Boolean rank was accepted by the CLI chunk loader")
+            require(len(loaded) == 2, "Invalid metadata triggered a tensor load")
+        for invalid in ({}, [dict(inputs="input.pt")], [dict(descriptor, inputs="")]):
+            config_path.write_text(json.dumps(dict(settings, continuations=invalid)), encoding="utf-8")
+            _reject(lambda: prefill_fwd.load_configuration(config_path), "Invalid chunk configuration was accepted")
+    return dict(relative_paths="checked", lazy_tensor_loading="checked", metadata_rank_order="checked")
+
+
 def main():
     """Publish a bounded HOST result without claiming numerical device acceptance."""
     result = dict(source=check_sources(), layer_plan=check_layer_plan(), controls=check_controls(),
                   runtime_configuration=check_runtime_configuration(),
+                  chunk_continuation=check_chunk_continuation(),
+                  chunk_configuration=check_chunk_configuration(),
                   device_initialization="not_run", compilation="not_run", NPU_numerics="not_run")
     print(json.dumps(result, sort_keys=True))
 

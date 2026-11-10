@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Wire original full40 Prefill providers, live state, actual HCCL and the layer39 output boundary."""
 
+from collections.abc import Mapping
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import gc
@@ -430,7 +431,23 @@ def _network_owner_snapshot(provider, storage):
 
 
 def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, continuation=None):
-    """Execute fresh and optional history chunks with explicit devices, weights and live cache state."""
+    """Execute a fresh chunk and a lazy stream of continuations with shared live state.
+
+    ``continuation`` is one chunk mapping or an iterable of chunk mappings.
+    Each item supplies inputs, its contract and every rank's metadata sources.
+    The iterable advances only after the preceding complete chunk returns.
+    """
+    if continuation is None:
+        following_chunks = iter(())
+    elif isinstance(continuation, Mapping):
+        following_chunks = iter((continuation,))
+    elif isinstance(continuation, (str, bytes)):
+        raise ValueError("Continuation must contain chunk mappings")
+    else:
+        try:
+            following_chunks = iter(continuation)
+        except TypeError as error:
+            raise ValueError("Continuation must be a chunk mapping or iterable") from error
     topology = contract["topology"]
     if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1):
         raise ValueError("The current network runtime requires DP4/TP4/EP16/PP1/PCP1/DCP1")
@@ -477,41 +494,63 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
             engram_contracts=engram_contracts, epoch=0, table_storage=table_storage, table_stack=table_stack)
         if continuation is None:
             return first
-        # The original full chunk, including final output/captures, must have returned before advancing.
-        following, next_contract = continuation["inputs"], continuation["contract"]
+        completed = [first]
+        previous_contract = contract
         fixed = ("topology", "checkpoint", "model_config", "required_modes", "capacity", "scheduler_capacity")
-        if any(next_contract[name] != contract[name] for name in fixed):
-            raise ValueError("Continuation cannot change numerical/model/topology configuration")
-        input_path = Path(next_contract["input_contract_path"])
-        if (file_sha(input_path) != next_contract["input_contract_sha256"]
-                or json.loads(input_path.read_text()) != following["input_contract"]
-                or following["input_contract"]["predecessor_input_sha256"] != contract["input_contract_sha256"]
-                or following["input_contract"]["epoch"] != 1):
-            raise ValueError("Require the independently admitted real second input and exact first identity")
-        metadata, receipts = [], []
-        for rank, record in enumerate(continuation["metadata_sources"]):
-            if record["rank"] != rank or file_sha(record["path"]) != record["sha256"]:
-                raise ValueError("Actual second-chunk metadata source changed")
-            metadata.append(torch.load(record["path"], map_location="cpu", weights_only=True))
-            receipts.append(dict(rank=rank, metadata_sha256=record["sha256"]))
-        if len(metadata) != 16:
-            raise ValueError("Continuation needs real original-builder metadata for every rank")
-        following = dict(following, cache_ABI=metadata)
-        before = _network_owner_snapshot(provider, table_storage)
-        provider.begin_chunk(epoch=1, token_map_id=next_contract["input_contract_sha256"],
-            input_by_case={"fresh": following["input_contract"]}, metadata_by_case={"fresh": metadata},
-            metadata_sources_by_case={"fresh": receipts})
-        after = _network_owner_snapshot(provider, table_storage)
-        if before != after:
-            raise RuntimeError("Chunk admission changed persistent raw/shared/history/table owners or bytes")
-        second_output = output / "continuation-chunk1"
-        second_output.mkdir(exist_ok=False)
-        write_json(second_output / "own-state-continuity.json", dict(before=before, after=after,
-            exact=True, previous_complete_output=True, scope="Own previous-final to current-initial; no cross-framework float byte gate"))
-        second = _run_network_chunk(following, contract=next_contract, output=second_output,
-            provider=provider, weights=weights, memory=memory, ownership=ownership, assigned=assigned,
-            engram_contracts=engram_contracts, epoch=1, table_storage=table_storage, table_stack=table_stack)
-        return dict(second, completed_prefill_chunks=[first, second], complete_network_acceptance="not_run")
+        for epoch, chunk in enumerate(following_chunks, start=1):
+            if not isinstance(chunk, Mapping) or not {"inputs", "contract", "metadata_sources"} <= chunk.keys():
+                raise ValueError("Each continuation needs inputs, contract and metadata_sources")
+            following, next_contract = chunk["inputs"], chunk["contract"]
+            required = set(fixed) | {"input_contract_path", "input_contract_sha256"}
+            if (not isinstance(following, Mapping) or "input_contract" not in following
+                    or not isinstance(next_contract, Mapping) or not required <= next_contract.keys()):
+                raise ValueError("Continuation needs prepared inputs and a complete network contract")
+            if checkpoint is not None:
+                next_contract = dict(next_contract, checkpoint=contract["checkpoint"])
+            if any(next_contract[name] != contract[name] for name in fixed):
+                raise ValueError("Continuation cannot change numerical/model/topology configuration")
+            input_path = Path(next_contract["input_contract_path"])
+            actual_input = following["input_contract"]
+            if not isinstance(actual_input, Mapping) or not {"epoch", "predecessor_input_sha256"} <= actual_input.keys():
+                raise ValueError("Continuation input must identify its epoch and predecessor")
+            if (file_sha(input_path) != next_contract["input_contract_sha256"]
+                    or json.loads(input_path.read_text()) != actual_input
+                    or actual_input["predecessor_input_sha256"] != previous_contract["input_contract_sha256"]
+                    or type(actual_input["epoch"]) is not int or actual_input["epoch"] != epoch):
+                raise ValueError("Continuation needs the next epoch and exact preceding input identity")
+            sources = chunk["metadata_sources"]
+            if not isinstance(sources, (list, tuple)) or len(sources) != topology["ep"]:
+                raise ValueError("Continuation needs real original-builder metadata for every rank")
+            metadata, receipts = [], []
+            for rank, record in enumerate(sources):
+                if not isinstance(record, Mapping) or not {"rank", "path", "sha256"} <= record.keys():
+                    raise ValueError("Each continuation metadata source needs rank, path and sha256")
+                if (type(record["rank"]) is not int or record["rank"] != rank
+                        or file_sha(record["path"]) != record["sha256"]):
+                    raise ValueError("Actual continuation metadata source changed")
+                metadata.append(torch.load(record["path"], map_location="cpu", weights_only=True))
+                receipts.append(dict(rank=rank, metadata_sha256=record["sha256"]))
+            following = dict(following, cache_ABI=metadata)
+            before = _network_owner_snapshot(provider, table_storage)
+            provider.begin_chunk(epoch=epoch, token_map_id=next_contract["input_contract_sha256"],
+                input_by_case={"fresh": actual_input}, metadata_by_case={"fresh": metadata},
+                metadata_sources_by_case={"fresh": receipts})
+            after = _network_owner_snapshot(provider, table_storage)
+            if before != after:
+                raise RuntimeError("Chunk admission changed persistent raw/shared/history/table owners or bytes")
+            chunk_output = output / f"continuation-chunk{epoch}"
+            chunk_output.mkdir(exist_ok=False)
+            write_json(chunk_output / "own-state-continuity.json", dict(before=before, after=after,
+                exact=True, previous_complete_output=True,
+                scope="Own previous-final to current-initial; no cross-framework float byte gate"))
+            result = _run_network_chunk(following, contract=next_contract, output=chunk_output,
+                provider=provider, weights=weights, memory=memory, ownership=ownership, assigned=assigned,
+                engram_contracts=engram_contracts, epoch=epoch, table_storage=table_storage, table_stack=table_stack)
+            completed.append(result)
+            previous_contract = next_contract
+        if len(completed) == 1:
+            return first
+        return dict(completed[-1], completed_prefill_chunks=completed, complete_network_acceptance="not_run")
 
 
 def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, ownership,

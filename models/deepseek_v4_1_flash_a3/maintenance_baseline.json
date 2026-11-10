@@ -393,8 +393,9 @@
     },
     "prefill_fwd.py": {
       "run_prefill": "d9a6848979b5d653f70a5b50d53a9b7b0614010b6b5c4c81d99fd9838d69f55b",
-      "load_configuration": "b40970cd8b7da8235adb7c0671ef591fcbf92fdffd05a0b1f9d3f3b63ec4c1ee",
-      "main": "4205b3d485b57fd25d6d97c6b30b8577175c1d8ff1dd3371359fdef072597ad4"
+      "load_configuration": "eef304d35e6888df08a88fbda65f170b46605e01beae66e0fc7b991c470db578",
+      "load_continuations": "1c10f0de7868f77eecd4c05db27a2478a82b631938058559dc7f17684110be85",
+      "main": "08974431e9da98846b0f13eb6a26f7fde55288a83e15623bb623d2647fe2871d"
     },
     "prefill_grouped_output.py": {
       "make_prefill_grouped_output": "e4b091318916503fcc5619e090ce40648e0838f8a27c20ee99e43b7afde6ae99"
@@ -513,7 +514,7 @@
       "load_product_backbone_input": "6cc4e6b044822ddb7989b3e0f6f062856e4e0061c586d0305c3411a7e78c2dba",
       "run_output_boundary": "03ef870275bf05169e0dab52a7a624ed0977f243d35b0012daf78de17819c965",
       "_network_owner_snapshot": "fa95779090b7a6f9d9dc6b2805cfdcbb69a04ff09b8e345c8a1aacb5a42b82b3",
-      "run_network_runtime": "20f4533dc79c8d45e667d14fc73d63c83d5be65803ef2600769c76d70a241458",
+      "run_network_runtime": "6be262d57a55bba663973c6650b4df3c4efd64391533dc0081536237c93dce0c",
       "_run_network_chunk": "3a1bb4793dc8e4acd25c1306b867d70caa0150f47039688326f09823245869d4"
     },
     "prefill_network_shared_observer.py": {
@@ -696,7 +697,9 @@
       "_reject": "4d916aced8be15cb2bb3dfa77f37bc21d20928aad709f014d8c27c8c670a5fd8",
       "check_controls": "fed6f90f57455cdaf60b3dce219e8308040e7e1c78a8e082bccb604f9c283ae4",
       "check_runtime_configuration": "e28af7d05e4410bd3b37cc8442bdb8d474cb5fe0eb1a3acd8c63bfb4869fedfc",
-      "main": "724f6663194a78490add237220a29ceadf09fd9e40d06b63382259a65e01b6a6"
+      "check_chunk_continuation": "6a2c84fb08dd872d8c868c33090805fba07d26f6a5933b94e2b3d6436b435945",
+      "check_chunk_configuration": "574cdbfd9dc0d32d10cf65f8c22638f2f6b83b389854afd583fc7d0c6db0b6be",
+      "main": "d381db803cdad9f82c6188b6f16d0d641b830eff3edf4274dfe76406ef8df4bb"
     },
     "weights.py": {
       "CheckpointOperands": "bcc095bf0742890c8c292d5d241767169aa13749ef89c0cbf1c980fcc0e2ed7e",

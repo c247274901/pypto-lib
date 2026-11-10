@@ -115,6 +115,85 @@ PP1/PCP1/DCP1 and capacity 16. Device IDs are runtime devices, not a claim of
 exact own-state identities, metadata lineage and unchanged numerical settings.
 Dataset accuracy remains a separate check after execution.
 
+### Continuous Prefill chunks
+
+Pass one prepared continuation mapping, or an iterable of mappings, through
+the existing `continuation` argument:
+
+```python
+result = run_prefill(
+    first_inputs, weights=checkpoint, cache=cache_state, config=first_contract,
+    devices=devices, output="build_output/ds41-prefill-chunks",
+    continuation=iter([chunk1, chunk2, chunk3]),
+)
+```
+
+Each continuation has `inputs`, `contract`, and `metadata_sources`. `inputs`
+uses the same prepared backbone input boundary as the first chunk. Its input
+contract must have the next integer `epoch` (1, 2, 3, ...) and a
+`predecessor_input_sha256` matching the immediately preceding completed chunk.
+The numerical configuration, model and topology stay fixed. The optional
+checkpoint override applies to the entire stream.
+
+`metadata_sources` is an ordered list of 16 `{rank, path, sha256}` descriptors
+for the next chunk's original-builder metadata. Every rank, including empty
+ranks, remains represented. The runner checks the input identity and each
+metadata file before admission. Existing cache/provider checks enforce request
+history, page ownership and completion of all 40 layers before advancing.
+The same weight provider, raw KV backing, shared index state, Engram history
+and retained Engram tables span the entire stream. An execution failure stops
+iteration; later chunks are not loaded. This does not change the weight-loading
+policy or establish that all weights reside in HBM.
+
+The iterable can load or prepare its next item lazily after the preceding
+chunk returns. First-chunk outputs retain their original location; subsequent
+outputs are in `continuation-chunk1`, `continuation-chunk2`, and so on, each
+with `own-state-continuity.json`. The returned result describes the final
+chunk and includes `completed_prefill_chunks` when a continuation completed.
+The original single-chunk and one-mapping/two-chunk calls remain supported.
+
+For the CLI, add prepared continuation descriptors to the main configuration:
+
+```json
+{
+  "continuations": [
+    {
+      "inputs": "inputs/chunk1-inputs.pt",
+      "contract": "inputs/chunk1-contract.json",
+      "metadata_sources": "inputs/chunk1-metadata-sources.json"
+    },
+    {
+      "inputs": "inputs/chunk2-inputs.pt",
+      "contract": "inputs/chunk2-contract.json",
+      "metadata_sources": "inputs/chunk2-metadata-sources.json"
+    }
+  ]
+}
+```
+
+These descriptor paths are relative to the main configuration. Each
+`metadata_sources` JSON file contains the ordered rank descriptors above;
+their `path` fields are relative to that descriptor file. Paths embedded in
+prepared Torch dictionaries and numerical/input contracts retain their
+explicit runtime meaning and must resolve from the execution directory.
+`--check-config` checks descriptor structure and path resolution without
+opening continuation tensors or initializing devices.
+
+Each chunk still has at most 16 query tokens per DP group. The existing QLI
+path still supports at most 512 cached index rows per request (therefore at
+most 512 original positions for ratio1 layers). Streaming does not remove
+that bound, construct metadata from raw text, implement request eviction, or
+add an autoregressive generation driver. A 2048-token prompt still requires
+the long-context Indexer implementation. These controls are independent of
+subsequent L2 composition and resident-weight changes.
+
+The HOST validator exercises four chunks with substituted device execution,
+including lazy loading, persistent state ownership, checkpoint overrides,
+the original two-chunk call, and rejection of stale lineage, skipped epochs,
+changed configuration, invalid rank metadata and failed execution. These are
+scheduler/control checks; they do not establish NPU numerical correctness or
+normal text generation.
+
 TP is passed to builders explicitly, for example
 `make_prefill_layer_entries(..., ep=16, tp=4)` or
 `make_prefill_grouped_output(tp=2)`. Importing a module does not inspect
