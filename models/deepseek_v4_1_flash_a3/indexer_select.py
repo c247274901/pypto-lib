@@ -6,20 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A2/A3 INT8 QLI scoring and Top-K selection.
-
-The A2/A3 DeepSeek V4.1 indexer does not have the A5 FP8/MX path.  Its
-selection ABI is nevertheless simple and stable: quantized per-head query
-rows are compared with a shared INT8 index-key cache, the two FP16 scales are
-applied in FP32, and the positive head scores are multiplied by the FP16
-per-head weights.  This module implements that boundary directly in PyPTO.
-
-``indices`` intentionally keeps the score order returned by QLI.  vLLM's
-``prepare_indexer_indices`` performs the later visibility filter and
-chronological sort; keeping that step separate makes the score/index boundary
-independently checkable on A2/A3 and lets the sparse-attention consumer use
-either ordering (attention is permutation invariant).
-"""
+"""Score INT8 index keys and select a causal Top-512 from up to 2048 keys."""
 
 from pathlib import Path
 import sys
@@ -32,16 +19,17 @@ import torch
 import pypto.language as pl
 
 
+# model config
 INDEX_HEADS = 32
 INDEX_HEAD_DIM = 128
 INDEX_TOPK = 512
-KEY_CAPACITY = 512
+KEY_CAPACITY = 2048
+NEGATIVE_INF = -3.0e38
+
+# tiling
 KEY_TILE = 32
 HEAD_TILE = 16
-# A2/A3 sort32 is most reliable at this width.  The public kernel signature
-# currently fixes the candidate row to this size.
-SORT_LEAF = 512
-NEGATIVE_INF = -3.0e38
+SORT_TILE = 512
 
 
 def indexer_select_reference(
@@ -111,13 +99,8 @@ def make_indexer_select(
         raise ValueError("capacity must be a positive multiple of 16")
     if heads != INDEX_HEADS or head_dim != INDEX_HEAD_DIM:
         raise ValueError("A2/A3 QLI uses 32 heads x 128")
-    # The native A2/A3 QLI handoff allocates one 512-entry candidate row.
-    # Smaller visible prefixes are represented by score padding and are
-    # filtered by ``prepare_indexer_indices`` in the next boundary.  The
-    # fixed signature is deliberate: larger or variable rows are not stable
-    # on the current A2/A3 sort32/mrgsort backend.
-    if key_capacity != KEY_CAPACITY:
-        raise ValueError(f"A2/A3 QLI uses fixed key_capacity={KEY_CAPACITY}")
+    if key_capacity not in (512, 1024, 2048):
+        raise ValueError("A2/A3 QLI key_capacity must be 512, 1024 or 2048")
     if topk != INDEX_TOPK:
         raise ValueError(f"A2/A3 QLI uses fixed topk={INDEX_TOPK}")
     if compress_ratio not in (1, 2):
@@ -136,23 +119,9 @@ def make_indexer_select(
         indices: pl.Tensor[[capacity, topk], pl.INT32],
     ):
         token = pl.tile.get_block_idx()
-        # The A2/A3 QLI cache ABI is one fixed 512-entry candidate row.  Sort
-        # the complete row here; ``prepare_indexer_indices`` applies the
-        # request-specific visible-prefix filter before cache gather.  Keeping
-        # this boundary fixed avoids dynamic tile tail writes on A2/A3 while
-        # preserving the final selected set.
-        visible = key_capacity
-        # QLI writes a score tile for every visible key.  Invalid rows never
-        # enter the sort, and score padding stays at the hardware minimum.
-        # Materialize that floor explicitly: dynamic ``valid_shape`` on a
-        # sort32 input is not reliable on the A2/A3 backend for partial rows.
-        pl.store(
-            pl.tile.full([1, key_capacity], dtype=pl.FP32, value=NEGATIVE_INF),
-            [token, 0],
-            scores,
-        )
-        for k0 in pl.range(0, visible, KEY_TILE):
-            valid = pl.min(KEY_TILE, visible - k0)
+        position = pl.read(positions, [token])
+        visible = pl.min(key_capacity, pl.max(0, (position + 1) // compress_ratio))
+        for k0 in pl.range(0, key_capacity, KEY_TILE):
             key_tile = key[k0:k0 + KEY_TILE, :]
             scale_tile = pl.reshape(pl.cast(key_scale[k0:k0 + KEY_TILE], pl.FP32), [1, KEY_TILE])
             q_tile = pl.reshape(query[token:token + 1, :, :], [heads, head_dim])
@@ -170,40 +139,34 @@ def make_indexer_select(
             reduced_vector = pl.mul(reduced, 1.0)
             reduced_row = pl.slice(reduced_vector, [1, KEY_TILE], [0, 0])
             total = pl.mul(reduced_row, scale_tile)
-            scores[token:token + 1, k0:k0 + KEY_TILE] = pl.fillpad(
-                pl.set_validshape(total, 1, valid), pad_value=pl.PadValue.min
-            )
+            scores[token:token + 1, k0:k0 + KEY_TILE] = total
 
-        # Match QLI's score-order result with a bounded merge sort.  The
-        # payload carries absolute key positions, so no host-side offset is
-        # needed for the fixed flattened cache used by the A2/A3 path.
-        # The A2/A3 ABI uses one 512-entry QLI candidate row.  Always execute
-        # the fixed sort once and represent a short visible prefix with the
-        # explicit score floor above; a dynamic ``pl.range(leaf_count)`` leaves
-        # the pair arena uninitialized for partial prefixes on A2/A3.
-        leaf0 = 0
-        row_raw = pl.load(scores, [token, leaf0], [1, SORT_LEAF])
-        row = pl.tile.fillpad(row_raw, pad_value=pl.PadValue.min)
-        row = pl.maximum(row, pl.tile.full([1, SORT_LEAF], dtype=pl.FP32, value=NEGATIVE_INF))
-        ramp = pl.tile.arange(0, [1, SORT_LEAF], dtype=pl.INT32)
-        leaf_indices = pl.tile.add(ramp, pl.cast(leaf0, pl.INT32))
-        sort_tmp = pl.tile.create([1, 2 * SORT_LEAF], dtype=pl.FP32)
-        leaf_pairs = pl.tile.sort32(
-            row, pl.reinterpret_view(leaf_indices, pl.UINT32), tmp=sort_tmp
-        )
-        leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=64)
-        leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=256)
-        leaf_pairs = pl.tile.slice(leaf_pairs, [1, 2 * topk], [0, 0])
-        pl.store(leaf_pairs, [token, 0], running_pairs)
-
-        # Materialize the complete padding row in one UB tile.  Explicitly
-        # initialize every lane because the backend may preserve stale pair
-        # lanes when only a dynamic prefix is written.
-        selected = pl.tile.full([1, topk], dtype=pl.INT32, value=-1)
-        if visible > 0:
-            pairs = pl.load(running_pairs, [token, 0], [1, 2 * topk])
-            picked = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            selected = picked
+        # Fixed 512-key leaves, causal masking and running Top-512 pairs.
+        for leaf0 in pl.range(0, key_capacity, SORT_TILE):
+            row_raw = pl.load(scores, [token, leaf0], [1, SORT_TILE])
+            ramp = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
+            absolute = pl.add(ramp, pl.cast(leaf0, pl.INT32))
+            distance = pl.mul(pl.sub(absolute, pl.cast(visible, pl.INT32)), -1)
+            valid = pl.minimum(pl.maximum(distance, 0), 1)
+            invalid = pl.sub(pl.tile.full([1, SORT_TILE], dtype=pl.INT32, value=1), valid)
+            valid_scores = pl.mul(row_raw, pl.cast(valid, pl.FP32))
+            invalid_scores = pl.mul(pl.cast(invalid, pl.FP32), NEGATIVE_INF)
+            row = pl.add(valid_scores, invalid_scores)
+            leaf_indices = pl.sub(absolute, pl.mul(pl.add(absolute, 1), invalid))
+            sort_tmp = pl.tile.create([1, 2 * SORT_TILE], dtype=pl.FP32)
+            leaf_pairs = pl.tile.sort32(row, pl.reinterpret_view(leaf_indices, pl.UINT32), tmp=sort_tmp)
+            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=64)
+            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=256)
+            if leaf0 == 0:
+                pl.store(leaf_pairs, [token, 0], running_pairs)
+            else:
+                previous = pl.load(running_pairs, [token, 0], [1, 2 * topk])
+                merge_tmp = pl.tile.create([1, 4 * topk], dtype=pl.FP32)
+                merged = pl.tile.mrgsort(previous, leaf_pairs, tmp=merge_tmp)
+                leading = pl.tile.slice(merged, [1, 2 * topk], [0, 0])
+                pl.store(leading, [token, 0], running_pairs)
+        pairs = pl.load(running_pairs, [token, 0], [1, 2 * topk])
+        selected = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
         pl.store(selected, [token, 0], indices)
         return scores, indices
 
@@ -230,8 +193,8 @@ def make_indexer_select(
     return kernel
 
 
-def golden_indexer_select(tensors):
-    """Evaluate all 512 candidates with the kernel's two FP16 narrowing boundaries."""
+def golden_indexer_select(tensors, *, compress_ratio=2):
+    """Score all keys and select the causal Top-512 with both FP16 boundaries."""
     active = int(tensors["active"])
     if not 0 <= active <= tensors["query"].shape[0]:
         raise ValueError("Indexer active rows must fit the actual capacity")
@@ -247,7 +210,10 @@ def golden_indexer_select(tensors):
         reduced = narrowed_weight[None] @ narrowed_dots
         scores = reduced[0] * tensors["key_scale"].float()
         tensors["scores"][token] = scores
-        tensors["indices"][token] = torch.argsort(scores, descending=True).to(torch.int32)
+        visible = min(len(key), max(0, (int(tensors["positions"][token]) + 1) // compress_ratio))
+        count = min(INDEX_TOPK, visible)
+        tensors["indices"][token].fill_(-1)
+        tensors["indices"][token, :count] = torch.argsort(scores[:visible], descending=True)[:count].int()
 
 
 def indexer_active_compare(active, *, exact=False):
@@ -265,52 +231,57 @@ def indexer_active_compare(active, *, exact=False):
     return compare
 
 
-def indexer_select_golden_cases(*, build=True):
-    """Use unique positive scores, negative-dot heads and ignored visibility positions."""
+def indexer_select_golden_cases(*, build=True, key_capacity=KEY_CAPACITY):
+    """Cover short and long histories, causal boundaries and negative-dot heads."""
+    from functools import partial
     from golden import ScalarSpec, TensorSpec
 
     capacity = 16
     rows = torch.arange(KEY_CAPACITY, dtype=torch.int32)
-    key = torch.ones((KEY_CAPACITY, INDEX_HEAD_DIM), dtype=torch.int8)
-    key[:, 0] = (rows // 4).to(torch.int8)
-    key[:, 1] = (rows % 4).to(torch.int8)
+    key = torch.zeros((KEY_CAPACITY, INDEX_HEAD_DIM), dtype=torch.int8)
+    key[:, 0] = (rows // 16).to(torch.int8)
+    key[:, 1] = (rows % 16).to(torch.int8)
     query = torch.ones((capacity, INDEX_HEADS, INDEX_HEAD_DIM), dtype=torch.int8)
-    query[:, :, 0] = 4
+    query[:, :, 0] = 16
     query[:, ::3] *= -1
     heads = torch.arange(INDEX_HEADS, dtype=torch.float32)
     query_scale = ((heads % 7 + 8.0) / 17.0).repeat(capacity, 1).to(torch.float16)
     weights = ((heads % 5 + 3.0) / 11.0).repeat(capacity, 1).to(torch.float16)
-    positions = torch.tensor([-1, 0, 1, 31, 127, 511, 1023, 2047] * 2, dtype=torch.int32)
+    boundaries = [-1, 0, 1, 31, 127, 511, 512, 513, 1023, 1024, 1025, 2046, 2047, 2048, 4095, 7]
+    positions = torch.tensor(boundaries, dtype=torch.int32)
+    key = key[:key_capacity]
     for ratio in (1, 2):
         for active in (0, 1, 7, capacity):
             specs = [
                 TensorSpec("query", [capacity, INDEX_HEADS, INDEX_HEAD_DIM], torch.int8, init_value=query),
                 TensorSpec("query_scale", [capacity, INDEX_HEADS], torch.float16, init_value=query_scale),
-                TensorSpec("key", [KEY_CAPACITY, INDEX_HEAD_DIM], torch.int8, init_value=key),
-                TensorSpec("key_scale", [KEY_CAPACITY], torch.float16, init_value=0.75),
+                TensorSpec("key", [key_capacity, INDEX_HEAD_DIM], torch.int8, init_value=key),
+                TensorSpec("key_scale", [key_capacity], torch.float16, init_value=0.75),
                 TensorSpec("weights", [capacity, INDEX_HEADS], torch.float16, init_value=weights),
                 TensorSpec("positions", [capacity], torch.int32, init_value=positions),
-                TensorSpec("scores", [capacity, KEY_CAPACITY], torch.float32, init_value=-53.0),
+                TensorSpec("scores", [capacity, key_capacity], torch.float32, init_value=-53.0),
                 TensorSpec("indices", [capacity, INDEX_TOPK], torch.int32, init_value=-59),
                 ScalarSpec("active", torch.int32, active, compile_runtime=True),
             ]
-            case = dict(name=f"indexer-fixed512-ratio{ratio}-active{active}", specs=specs,
-                        golden_fn=golden_indexer_select,
+            case = dict(name=f"indexer-keys{key_capacity}-top512-ratio{ratio}-active{active}", specs=specs,
+                        golden_fn=partial(golden_indexer_select, compress_ratio=ratio),
                         compare_fn=dict(scores=indexer_active_compare(active),
                                         indices=indexer_active_compare(active, exact=True)))
             if build:
-                case["fn"] = make_indexer_select(capacity, KEY_CAPACITY, compress_ratio=ratio)
+                case["fn"] = make_indexer_select(capacity, key_capacity, compress_ratio=ratio)
             yield case
 
 
 def validate(*, device=0, sim=False, compile_only=False, cpu_only=False):
-    """Run fixed-row kernel goldens without applying the later visibility filter."""
+    """Check causal selection at supported key capacities and active-row boundaries."""
     from golden import run
+    from itertools import chain
 
     if cpu_only and compile_only:
         raise ValueError("CPU golden checks and kernel compilation are separate modes")
     records = []
-    for case in indexer_select_golden_cases(build=not cpu_only):
+    cases = (indexer_select_golden_cases(build=not cpu_only, key_capacity=keys) for keys in (512, 1024, 2048))
+    for case in chain.from_iterable(cases):
         name = case.pop("name")
         if cpu_only:
             values = {spec.name: spec.create_tensor().clone() if hasattr(spec, "create_tensor") else spec.to_python()
@@ -326,9 +297,14 @@ def validate(*, device=0, sim=False, compile_only=False, cpu_only=False):
                 ordered = torch.sort(scores, dim=1).values
                 if not (torch.diff(ordered, dim=1) > 0).all():
                     raise RuntimeError("The exact-index fixture must contain no tied scores")
-                expected = torch.arange(KEY_CAPACITY - 1, -1, -1, dtype=torch.int32).repeat(active, 1)
+                ratio = int(name.split("ratio")[1].split("-")[0])
+                expected = torch.full((active, INDEX_TOPK), -1, dtype=torch.int32)
+                for token in range(active):
+                    visible = min(len(values["key"]), max(0, (int(values["positions"][token]) + 1) // ratio))
+                    count = min(visible, INDEX_TOPK)
+                    expected[token, :count] = torch.arange(visible - 1, visible - count - 1, -1).int()
                 if not torch.equal(values["indices"][:active], expected):
-                    raise RuntimeError("The fixed 512-row selection changed its exact score ordering")
+                    raise RuntimeError("Causal Top-512 selection changed its exact score ordering")
                 if not torch.isfinite(scores).all():
                     raise RuntimeError("Indexer golden produced nonfinite scores")
             records.append(dict(name=name, cpu_golden="passed", device="not_run", inactive_Out_rows="undefined"))
@@ -362,4 +338,5 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--cpu-only", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(validate(device=args.device, sim=args.sim, compile_only=args.compile_only, cpu_only=args.cpu_only)))
+    result = validate(device=args.device, sim=args.sim, compile_only=args.compile_only, cpu_only=args.cpu_only)
+    print(json.dumps(result))

@@ -13,6 +13,7 @@ import pypto.language as pl
 from .linear_primitives import N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
 from .norm_rope import make_adjacent_rope as make_rope
 from .qkv_proj_rope import make_bf16_projection_staged
+from .indexer_select import KEY_CAPACITY
 
 
 # Model configuration.
@@ -245,14 +246,14 @@ def make_index_key_gather(cache_blocks, requests, table_pages, page_rows=64):
         cache: pl.Tensor[[cache_blocks, page_rows, 1, INDEX_WIDTH], pl.INT8],
         scales: pl.Tensor[[cache_blocks, page_rows, 1, 1], pl.FP16],
         table: pl.Tensor[[requests, table_pages], pl.INT32],
-        key: pl.InOut[pl.Tensor[[512, INDEX_WIDTH], pl.INT8]],
-        key_scale: pl.InOut[pl.Tensor[[512], pl.FP16]],
+        key: pl.InOut[pl.Tensor[[KEY_CAPACITY, INDEX_WIDTH], pl.INT8]],
+        key_scale: pl.InOut[pl.Tensor[[KEY_CAPACITY], pl.FP16]],
         request: pl.Scalar[pl.INT32],
         length: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(cache, [cache_blocks * page_rows, INDEX_WIDTH])
         scale_flat = pl.reshape(scales, [cache_blocks * page_rows, 1])
-        with pl.spmd(512 // KEY_ROWS_TILE, name_hint="index_key_pack"):
+        with pl.spmd(KEY_CAPACITY // KEY_ROWS_TILE, name_hint="index_key_pack"):
             start = pl.tile.get_block_idx() * KEY_ROWS_TILE
             zero_values = pl.full([KEY_ROWS_TILE, INDEX_WIDTH], dtype=pl.FP16, value=0.0)
             values = pl.cast(zero_values, pl.INT8, mode="trunc")
@@ -266,7 +267,7 @@ def make_index_key_gather(cache_blocks, requests, table_pages, page_rows=64):
             key[start:start + KEY_ROWS_TILE, :] = values
         with pl.spmd(1, name_hint="index_key_scale_pack"):
             _writer = pl.tile.get_block_idx()
-            for row in pl.range(512):
+            for row in pl.range(KEY_CAPACITY):
                 scale = pl.cast(0.0, pl.FP16)
                 if row < length:
                     block = pl.cast(pl.read(table, [request, row // page_rows]), pl.INDEX)
@@ -333,9 +334,89 @@ def make_physical_index_query_entries(capacity, config, cache_blocks, requests, 
         index_query_quant=make_indexer_query_quantize(capacity),
         index_weights_scale=make_index_weights(capacity),
         index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages, page_rows=128 // compress_ratio),
-        index_select=make_indexer_select(capacity, 512, compress_ratio=compress_ratio),
+        index_select=make_indexer_select(capacity, KEY_CAPACITY, compress_ratio=compress_ratio),
         sparse_controls=make_sparse_controls(capacity, requests, table_pages, table_pages,
                                             long_page_rows=128 // compress_ratio, compress_ratio=compress_ratio,
                                             long_page_stride=128),
         shared_index_publish=make_shared_index_publish(capacity),
     )
+
+
+def golden_index_key_gather(args):
+    """Pack one request's visible cache rows and zero the unused key arena."""
+    import torch
+
+    args["key"].zero_()
+    args["key_scale"].zero_()
+    length, request = int(args["length"]), int(args["request"])
+    rows = args["cache"].shape[1]
+    logical = torch.arange(length)
+    pages = args["table"][request, logical // rows].long()
+    args["key"][:length] = args["cache"][pages, logical % rows, 0]
+    args["key_scale"][:length] = args["scales"][pages, logical % rows, 0, 0]
+
+
+def validate_key_gather(*, device=0, sim=False, compile_only=False, cpu_only=False):
+    """Check both compressed page geometries, permuted pages and partial final tiles."""
+    import torch
+    from golden import ScalarSpec, TensorSpec, run
+
+    if cpu_only and compile_only:
+        raise ValueError("CPU golden checks and kernel compilation are separate modes")
+    records = []
+    for rows in (64, 128):
+        pages, blocks = KEY_CAPACITY // rows, KEY_CAPACITY // rows + 2
+        physical = torch.arange(blocks * rows)
+        codes = ((physical[:, None] + torch.arange(INDEX_WIDTH)[None, :]) % 127).to(torch.int8)
+        codes = codes.reshape(blocks, rows, 1, INDEX_WIDTH)
+        scales = ((physical.float() + 1) / 4096).half().reshape(blocks, rows, 1, 1)
+        table = torch.stack((torch.arange(1, pages + 1), torch.arange(pages, 0, -1))).int()
+        for length in (0, 1, 511, 512, 513, 1024, 2048):
+            specs = [
+                TensorSpec("cache", [blocks, rows, 1, INDEX_WIDTH], torch.int8, init_value=codes),
+                TensorSpec("scales", [blocks, rows, 1, 1], torch.float16, init_value=scales),
+                TensorSpec("table", [2, pages], torch.int32, init_value=table),
+                TensorSpec("key", [KEY_CAPACITY, INDEX_WIDTH], torch.int8, init_value=-53),
+                TensorSpec("key_scale", [KEY_CAPACITY], torch.float16, init_value=-59),
+                ScalarSpec("request", torch.int32, 1, compile_runtime=True),
+                ScalarSpec("length", torch.int32, length, compile_runtime=True),
+            ]
+            if cpu_only:
+                values = {spec.name: spec.create_tensor() if hasattr(spec, "create_tensor") else spec.to_python()
+                          for spec in specs}
+                golden_index_key_gather(values)
+                expected_rows = [int(table[1, row // rows]) * rows + row % rows for row in range(length)]
+                if (not torch.equal(values["key"][:length], codes.reshape(-1, INDEX_WIDTH)[expected_rows])
+                        or (values["key"][length:] != 0).any() or (values["key_scale"][length:] != 0).any()):
+                    raise RuntimeError("Paged key gather mixed requests, physical pages or padded rows")
+            else:
+                result = run(
+                    fn=make_index_key_gather(blocks, 2, pages, page_rows=rows),
+                    specs=specs,
+                    golden_fn=golden_index_key_gather,
+                    config=dict(backend_type="a2a3", execution_mode=bool(sim), device_id=device),
+                    compile_only=compile_only,
+                    rtol=0,
+                    atol=0,
+                )
+                if not result.passed:
+                    raise RuntimeError(f"index-key-gather-rows{rows}-length{length}: {result.error}")
+            records.append(dict(page_rows=rows, length=length, compiled=not cpu_only,
+                                cpu_golden="passed" if cpu_only else "not_run",
+                                kernel="not_run" if cpu_only or compile_only else "passed"))
+    return records
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--cpu-only", action="store_true")
+    args = parser.parse_args()
+    print(json.dumps(validate_key_gather(device=args.device, sim=args.sim,
+        compile_only=args.compile_only, cpu_only=args.cpu_only)))

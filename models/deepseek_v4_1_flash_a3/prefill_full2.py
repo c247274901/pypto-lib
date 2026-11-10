@@ -67,7 +67,7 @@ def make_entries(active, *, compressor_projected=False):
 def make_physical_compressed_entries(capacity, config, cache_blocks, requests, table_pages, *,
                                      compress_ratio=2, cache_layout=None, layer_id=2, network_cache=False):
     """Build paged physical-layer C2, index packing and full-head compressed attention entries."""
-    from .indexer_select import make_indexer_select
+    from .indexer_select import KEY_CAPACITY, make_indexer_select
     from .norm_rope import make_rope_tables
     from .rmsnorm import make_blocked_rmsnorm as make_norm
     from .norm_rope import make_adjacent_rope as make_rope
@@ -112,7 +112,7 @@ def make_physical_compressed_entries(capacity, config, cache_blocks, requests, t
             compressor_norm=pl.jit(make_norm(capacity, 512, config["rms_norm_eps"])._func),
             index_publish=make_index_cache_publish_observed(capacity, cache_blocks, page_rows=128),
             index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages, page_rows=128),
-            index_select=make_indexer_select(capacity, 512, compress_ratio=1),
+            index_select=make_indexer_select(capacity, KEY_CAPACITY, compress_ratio=1),
             sparse_controls=make_sparse_controls(capacity, requests, table_pages, table_pages,
                                                 long_page_rows=128, compress_ratio=1),
             candidate_pool=make_candidate_block_pool(capacity),

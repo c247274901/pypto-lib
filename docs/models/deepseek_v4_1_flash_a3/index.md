@@ -51,6 +51,7 @@ The original source names in this manifest are intentional provenance.
 | Original 40-layer composition | `prefill_layer.run_prefill_network_inmemory` |
 | Actual checkpoint, persistent state, HCCL and L39 head | `prefill_network_runtime.run_network_runtime` |
 | Input embedding / HC and final output kernels | `prefill_embedding.py`, `prefill_network_input.py`, `prefill_output.py` |
+| Automatic prompt chunking and history/page metadata | `prefill_prepare.py` |
 | SWA and C2/C1 attention | `prefill_swa.py`, `prefill_full2*.py`, `prefill_consumer*.py`, `prefill_ratio1.py` |
 | Persistent source/cache ownership | `prefill_network_state.py`, `prefill_network_cache.py`, `prefill_layer_state.py` |
 | Two Engram slots and singleton history | `prefill_network_engram.py`, `prefill_engram_runtime.py`, `engram_storage.py` |
@@ -105,9 +106,9 @@ physical aliases are interpreted by `NetworkCacheProvider`; metadata must
 match the actual allocated tensors. The JSON `contract` supplies `topology`,
 `model_config`, `required_modes`, `capacity`, `scheduler_capacity`,
 `fresh_shared_initialization`, `input_contract_sha256` and `state_regions`
-(path and SHA256). These remain explicit state/operand contracts. This entry
-accepts an already prepared canonical backbone/cache boundary; it does not
-create that boundary from only a checkpoint and a text prompt.
+(path and SHA256). These remain explicit state/operand contracts for prepared
+inputs. The automatic path below creates per-chunk backbone inputs and metadata
+from text or token IDs, using existing cache-layout and Engram templates.
 
 The current runtime supports the original 40-layer plan with DP4/TP4/EP16,
 PP1/PCP1/DCP1 and capacity 16. Device IDs are runtime devices, not a claim of
@@ -116,6 +117,70 @@ exact own-state identities, metadata lineage and unchanged numerical settings.
 Dataset accuracy remains a separate check after execution.
 
 ### Continuous Prefill chunks
+
+For a single request containing 1..2048 tokens, pass a token-ID list or raw
+completion text to the same public entry:
+
+```python
+result = run_prefill(
+    token_ids, weights=checkpoint, cache=cache_state, config=network_contract,
+    devices=devices, output="build_output/ds41-prefill-2048",
+)
+```
+
+The default is `chunk_size=16` and `dp_rank=0`. Set these fields in the Python
+`config` to select chunks of 1..16 tokens or DP engine 0..3. All other DP
+engines are empty, and all 16 ranks remain represented. A 2048-token request
+produces 128 chunks at the default size, retaining earlier cache/history state.
+This is sequential chunked Prefill; it does not make the executable query
+capacity 2048 or implement Decode, sampling or an autoregressive text loop.
+The final result points to the last chunk's output-head artifacts.
+
+For the CLI, replace `inputs` with either `prompt` or `token_ids`, omit
+`continuations`, and optionally set `chunk_size` and `dp_rank`:
+
+```json
+{
+  "checkpoint": "weights/deepseek-v4.1-flash-w8a8",
+  "prompt": "Please continue this passage.",
+  "chunk_size": 16,
+  "dp_rank": 0,
+  "cache_state": "inputs/cache-state.pt",
+  "contract": "inputs/network-contract.json",
+  "devices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "output": "build_output/ds41-prefill-2048"
+}
+```
+
+Text uses the checkpoint's `tokenizer.json` through `tokenizers`; it does not
+apply a chat template. Supply token IDs for an already formatted conversation.
+The limit applies after tokenization, and oversized prompts fail rather than
+being truncated. The model configuration must match the selected checkpoint.
+
+Automatic preparation still needs the 16 original `cache_ABI` templates
+(`layout`, `groups`, `hash_constants`) and both TP4 Engram contracts in
+`cache_state`. The templates describe physical storage and model constants;
+their previous token coordinates and cache contents are not imported. Preparation
+reserves fresh pages for the entire prompt once, preserving storage keys,
+typed-plane offsets, strides and aliases. It creates each chunk's positions,
+query starts, sequence/cache lengths, SWA/C1/C2 slots, C2 RoPE source positions,
+input lineage and exact state-write complements. The numerical configuration,
+required modes and deterministic initial TopK state remain explicit in
+`network_contract`; per-input hashes and state regions are regenerated.
+
+Prepared files are written under `output/prepared/chunk-N`; execution files
+are under `output/network`. Later chunks are prepared only after the preceding
+chunk completes all 40 layers. Embedding uses the existing PyPTO input stage.
+This does not change the network weight-loading or resident-weight policy.
+
+The Indexer searches up to 2048 cached keys. Ratio2 layers therefore see up to
+1024 completed keys for a 2048-token prompt, while ratio1 layers see 2048.
+TopK remains 512, and attention retains its 128-window plus 512-compressed
+slots. Causal masking happens before TopK selection, followed by chronological
+index preparation. Layer20 publishes all visible eight-key candidate blocks
+(at most 256 here), and layer24 retains its full-coverage guard. Longer histories
+requiring candidate pruning, request eviction and multi-request automatic
+scheduling are outside this bounded path.
 
 Pass one prepared continuation mapping, or an iterable of mappings, through
 the existing `continuation` argument:
@@ -179,12 +244,9 @@ explicit runtime meaning and must resolve from the execution directory.
 `--check-config` checks descriptor structure and path resolution without
 opening continuation tensors or initializing devices.
 
-Each chunk still has at most 16 query tokens per DP group. The existing QLI
-path still supports at most 512 cached index rows per request (therefore at
-most 512 original positions for ratio1 layers). Streaming does not remove
-that bound, construct metadata from raw text, implement request eviction, or
-add an autoregressive generation driver. A 2048-token prompt still requires
-the long-context Indexer implementation. These controls are independent of
+Each prepared chunk still has at most 16 query tokens per DP group and at most
+2048 cached index rows per request. Callers of the prepared interface continue
+to own all input and metadata preparation. These controls are independent of
 subsequent L2 composition and resident-weight changes.
 
 The HOST validator exercises four chunks with substituted device execution,
@@ -224,19 +286,29 @@ Run bounded host controls and operator checks from the repository root:
 
 ```bash
 python -B -m models.deepseek_v4_1_flash_a3.validate
+python -B -m models.deepseek_v4_1_flash_a3.prefill_prepare --validate-host
 python -m models.deepseek_v4_1_flash_a3.hc -p a2a3 --cpu-only
 python -m models.deepseek_v4_1_flash_a3.swa -p a2a3 --cpu-only
 python -m models.deepseek_v4_1_flash_a3.indexer_select -p a2a3 --cpu-only
+python -m models.deepseek_v4_1_flash_a3.prefill_indexer -p a2a3 --cpu-only
+python -m models.deepseek_v4_1_flash_a3.candidate_pool -p a2a3 --cpu-only
 python -m models.deepseek_v4_1_flash_a3.prefill_embedding -p a2a3 -d 0
 ```
 
 `validate` uses only the standard library. It checks the maintained import DAG,
 public exports, all 40 roles, scheduler/EP ownership, TP import independence and
-device mappings. It deliberately does not require historical AST equality.
+device mappings, as well as automatic CLI controls and lazy entry dispatch.
+`prefill_prepare --validate-host` additionally uses Torch and the compiler
+environment to check 128 chunks covering 2048 tokens, all layer/rank coordinates
+at sampled history boundaries, original page geometry, exact write regions,
+odd compression boundaries, a partial final chunk and invalid input rejection.
+These use synthetic layout templates and do not prove device numerical accuracy.
+The HOST validator deliberately does not require historical AST equality.
 `audit_source` performs the separate opt-in source identity audit.
 
 Executable operator entries accept `-p/--platform a2a3`, `-d/--device`,
-`--sim` and `--compile-only`. HC, SWA and QLI additionally support `--cpu-only`;
+`--sim` and `--compile-only`. HC, SWA, QLI, paged index-key gathering and the
+candidate pool additionally support `--cpu-only`;
 that mode checks Torch reference fixtures without running kernels and cannot
 be combined with `--compile-only`. Default device runs use `golden.run` with
 the same compute factories as model composition. HC/SWA compare floating
@@ -262,3 +334,15 @@ certify this refactor. An AST comparison preserved all 200 original JIT definiti
 this structural check does not replace numerical regression.
 No original task source, Goal or device job was changed for these checks.
 See [migration notes](prefill_migration.md) for provenance and helper ownership.
+
+The 2048-token extension adds separate HOST and compilation evidence: 24
+Indexer reference/compile cases cover key capacities 512/1024/2048, both
+compression ratios and active-row boundaries; 14 paged-gather cases cover
+64/128-row pages and history lengths 0/1/511/512/513/1024/2048; eight candidate
+pool/publication cases cover empty and partial rows and persistent count/tail
+preservation. All passed CPU reference controls and A2/A3 compilation in the
+PyPTO environment with PTOAS 0.72. The actual checkpoint tokenizer and all three
+input-stage entries also passed tokenization/compilation checks without loading
+weight payloads. The new kernels and automatic 2048-token network path have
+not been numerically validated on an NPU, and no text-generation result is
+claimed by these checks.

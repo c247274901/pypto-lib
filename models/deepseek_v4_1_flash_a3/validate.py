@@ -448,7 +448,68 @@ def check_chunk_configuration():
         for invalid in ({}, [dict(inputs="input.pt")], [dict(descriptor, inputs="")]):
             config_path.write_text(json.dumps(dict(settings, continuations=invalid)), encoding="utf-8")
             _reject(lambda: prefill_fwd.load_configuration(config_path), "Invalid chunk configuration was accepted")
-    return dict(relative_paths="checked", lazy_tensor_loading="checked", metadata_rank_order="checked")
+        automatic = dict(settings)
+        automatic.pop("inputs")
+        automatic.pop("continuations")
+        for input_fields in (dict(prompt="Hello"), dict(token_ids=list(range(2048)))):
+            config_path.write_text(json.dumps(dict(automatic, **input_fields)), encoding="utf-8")
+            resolved = prefill_fwd.load_configuration(config_path)
+            require(resolved["chunk_size"] == 16 and resolved["dp_rank"] == 0, "Automatic defaults changed")
+        for invalid in (dict(token_ids=[]), dict(token_ids=[True]), dict(token_ids=[-1]),
+                        dict(token_ids=list(range(2049))), dict(prompt=""), dict(prompt="Hello", token_ids=[1]),
+                        dict(prompt="Hello", inputs="prepared.pt"), dict(prompt="Hello", chunk_size=17),
+                        dict(prompt="Hello", chunk_size=True), dict(prompt="Hello", dp_rank=4),
+                        dict(prompt="Hello", continuations=[descriptor])):
+            config_path.write_text(json.dumps(dict(automatic, **invalid)), encoding="utf-8")
+            _reject(lambda: prefill_fwd.load_configuration(config_path), "Invalid automatic configuration was accepted")
+    return dict(relative_paths="checked", lazy_tensor_loading="checked", metadata_rank_order="checked",
+                automatic_schema="checked")
+
+
+def check_automatic_entry():
+    """Check lazy automatic-input dispatch without importing Torch, PyPTO or devices."""
+    import os
+    import sys
+    from tempfile import TemporaryDirectory
+    from types import ModuleType
+    from unittest.mock import patch
+
+    from . import prefill_fwd
+
+    observed = []
+    prepare = ModuleType(__package__ + ".prefill_prepare")
+    runtime = ModuleType(__package__ + ".prefill_network_runtime")
+
+    def chunks(inputs, **kwargs):
+        require(inputs == list(range(32)), "Automatic entry changed the token IDs")
+        require(kwargs["chunk_size"] == 16 and kwargs["dp_rank"] == 2, "Automatic controls were not forwarded")
+        for epoch in range(2):
+            require(observed == list(range(epoch)), "Automatic entry prefetched the next chunk")
+            yield dict(inputs=dict(input_contract=dict(epoch=epoch), prepare_input_stage=True),
+                       cache=dict(cache_ABI="reserved-layout"), contract=kwargs["config"], metadata_sources=[])
+
+    def execute(inputs, **kwargs):
+        require(inputs["cache_ABI"] == "reserved-layout", "The first automatic layout was not supplied")
+        require(inputs["prepare_input_stage"] is True, "Automatic input embedding was skipped")
+        observed.append(inputs["input_contract"]["epoch"])
+        for packet in kwargs["continuation"]:
+            observed.append(packet["inputs"]["input_contract"]["epoch"])
+        return dict(completed=list(observed))
+
+    prepare.prepare_token_chunks, runtime.run_network_runtime = chunks, execute
+    with TemporaryDirectory(prefix="a3-automatic-entry-") as temporary:
+        config = dict(topology=dict(ep=16), chunk_size=16, dp_rank=2)
+        with patch.dict(sys.modules, {prepare.__name__: prepare, runtime.__name__: runtime}), \
+                patch.dict(os.environ, {}, clear=True):
+            result = prefill_fwd.run_prefill(list(range(32)), weights="checkpoint", cache={}, config=config,
+                devices=list(range(16)), output=Path(temporary) / "new-output")
+            require(result == {"completed": [0, 1]}, "The automatic public entry lost a chunk")
+            _reject(lambda: prefill_fwd.run_prefill([1], weights="checkpoint", cache={}, config=config,
+                devices=list(range(16)), output=temporary), "Automatic entry accepted an existing output directory")
+            _reject(lambda: prefill_fwd.run_prefill([1], weights="checkpoint", cache={}, config=config,
+                devices=list(range(16)), output=Path(temporary) / "another", continuation=[]),
+                "Automatic entry accepted conflicting explicit continuations")
+    return dict(lazy_preparation="checked", reserved_cache="forwarded", execution="stubbed_not_validated")
 
 
 def main():
@@ -457,6 +518,7 @@ def main():
                   runtime_configuration=check_runtime_configuration(),
                   chunk_continuation=check_chunk_continuation(),
                   chunk_configuration=check_chunk_configuration(),
+                  automatic_entry=check_automatic_entry(),
                   device_initialization="not_run", compilation="not_run", NPU_numerics="not_run")
     print(json.dumps(result, sort_keys=True))
 

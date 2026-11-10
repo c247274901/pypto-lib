@@ -15,6 +15,68 @@ from pathlib import Path
 import torch
 
 from .runtime_utils import file_sha, write_json
+from .prefill_layer_state import resolve_layer_role
+
+
+def build_state_regions(payloads, input_contract_sha256, scheduler_capacity=8192):
+    """Derive exact write complements from chunk slots, ring rows and layer roles."""
+    def complement(extent, intervals):
+        cursor, result = 0, []
+        for begin, end in sorted(intervals):
+            if not 0 <= begin < end <= extent:
+                raise ValueError("A prepared write interval escapes its original byte arena")
+            if cursor < begin:
+                result.append([cursor, begin])
+            cursor = max(cursor, end)
+        if cursor < extent:
+            result.append([cursor, extent])
+        return result
+
+    ranks = {}
+    for rank, payload in enumerate(payloads):
+        layout, metadata = payload["layout"], payload["metadata"]
+        extents = {key: value["shape"][0] for key, value in layout["raw"].items()}
+        layers = []
+        for layer in range(40):
+            role = resolve_layer_role(layer)
+            root = f"model.layers.{layer}.self_attn."
+            writable = [root + "swa_cache"]
+            if role["mode"] == "full":
+                writable += [root + "long_kv_cache", root + "indexer.k_cache"]
+                if role["ratio"] == 2:
+                    writable.append(root + "compressor.state_cache")
+            intervals = {key: [] for key in extents}
+            for name in writable:
+                controls = metadata[name]["global_metadata"]
+                slots = controls["slot_mapping"].tolist()
+                if name.endswith("compressor.state_cache"):
+                    starts = payload["query_start_loc"].tolist()
+                    table = controls["block_table"].tolist()
+                    slots = [[table[request][0], int(payload["positions"][token]) % 32]
+                             for request, (begin, end) in enumerate(zip(starts, starts[1:]))
+                             for token in range(begin, end)]
+                descriptor = layout["views"][name]
+                for plane in descriptor if isinstance(descriptor, list) else [descriptor]:
+                    dtype = getattr(torch, plane["dtype"].split(".")[-1])
+                    size = torch.empty((), dtype=dtype).element_size()
+                    for page, row in slots:
+                        if page < 0:
+                            continue
+                        offset = plane["storage_offset_bytes"] + (page * plane["stride"][0] + row * plane["stride"][1]) * size
+                        intervals[plane["storage_key"]].append([offset, offset + plane["shape"][-1] * size])
+            active = metadata[root + "swa_cache"]["num_actual_tokens"]
+            shared = {}
+            for name in ("topk_indices", "topk_lengths", "candidates", "candidate_lengths"):
+                writes = role["index_selection_write"] if name.startswith("topk_") else role["candidate_write"]
+                if name == "candidate_lengths":
+                    writes = False
+                shared[name] = [[active if writes else 0, scheduler_capacity]]
+            layers.append(dict(layer=layer,
+                raw_readonly_untouched_complement={key: complement(extent, intervals[key]) for key, extent in extents.items()},
+                shared_readonly_untouched_rows=shared))
+        ranks[str(rank)] = dict(raw_extents=extents, layers=layers)
+    return dict(complete_rank_metadata=len(payloads) == 16, result_dependent_masks=False,
+                input_contract_sha256=input_contract_sha256, ranks=ranks)
 
 
 def interval_digest(value, intervals, identity):

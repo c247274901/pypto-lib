@@ -10,6 +10,8 @@
 
 import torch
 
+from .indexer_select import KEY_CAPACITY
+
 
 def validate_refresh_candidates(contract):
     """Require the bounded route where candidate blocks cover every visible source key."""
@@ -27,8 +29,8 @@ def validate_live_refresh_candidates(original, shared, source_id):
     metadata = original["cache_metadata"]["actual_metadata"]
     prefix = f"model.layers.{source_id}.self_attn."
     lengths = metadata[prefix + "indexer.k_cache"]["global_metadata"]["cache_seq_lens"].tolist()
-    if any(length < 0 or length > 512 for length in lengths):
-        raise ValueError("Long candidate-pruning refresh remains unsupported")
+    if any(length < 0 or length > KEY_CAPACITY for length in lengths):
+        raise ValueError("Refresh history exceeds the supported index-key capacity")
     start = original["cp_token_range"][0]
     candidates = shared["candidates"]
     for local in range(original["actual_local_query_rows"]):
@@ -83,24 +85,25 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
     execute("index_query_quant", rank, case, [query_key.reshape(capacity, 32, 128), query_codes, query_scales, query_rows],
             dict(codes=query_codes, scales=query_scales), "index_quant")
     execute("index_weights_scale", rank, case, [weights_proj, weights, query_rows], dict(weights=weights), "index_key")
-    candidate_scores = zeros(capacity, 512, dtype=torch.float32)
+    candidate_scores = zeros(capacity, KEY_CAPACITY, dtype=torch.float32)
     raw_selected = torch.full((capacity, 512), -1, dtype=torch.int32)
     q_positions, q_requests = pad(positions[start:start + query_rows]), pad(request_ids[start:start + query_rows], fill=-1)
     long_table, window_table = table(source_prefix + "long_kv_cache"), table(own_prefix + "swa_cache")
     cache_lengths = global_meta[source_prefix + "indexer.k_cache"]["cache_seq_lens"].tolist()
-    if any(length < 0 or length > 512 for length in cache_lengths):
-        raise ValueError("Physical producer QLI requires at most 512 cached rows per request")
+    if any(length < 0 or length > KEY_CAPACITY for length in cache_lengths):
+        raise ValueError("Physical QLI history exceeds the supported index-key capacity")
     for request, (begin, finish) in enumerate(zip(actual_starts.tolist(), actual_starts.tolist()[1:])):
         left, right = max(begin, start), min(finish, start + query_rows)
         if left >= right:
             continue
         offset, count = left - start, right - left
-        packed_key = zeros(512, 128, dtype=torch.int8)
-        packed_scale = zeros(512, dtype=torch.float16)
+        packed_key = zeros(KEY_CAPACITY, 128, dtype=torch.int8)
+        packed_scale = zeros(KEY_CAPACITY, dtype=torch.float16)
         execute("index_key_gather", rank, case + f"-request-{request}",
                 [codes, scales, long_table, packed_key, packed_scale, request, cache_lengths[request]],
                 dict(key=packed_key, scales=packed_scale), "index_select")
-        scores, picked = zeros(capacity, 512, dtype=torch.float32), torch.full((capacity, 512), -1, dtype=torch.int32)
+        scores = zeros(capacity, KEY_CAPACITY, dtype=torch.float32)
+        picked = torch.full((capacity, 512), -1, dtype=torch.int32)
         selection_args = [pad(query_codes[offset:offset + count]), pad(query_scales[offset:offset + count]),
                           packed_key, packed_scale, pad(weights[offset:offset + count]),
                           pad(q_positions[offset:offset + count]).to(torch.int32), scores, picked, count]
@@ -124,5 +127,8 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
                   "indexer.query_before_quantize": query_key[:query_rows].reshape(query_rows, 32, 128).clone(),
                   "indexer.quantized_query_and_scale": (query_codes[:query_rows].clone(), query_scales[:query_rows].clone()),
                   "indexer.selected_indices": selected[:query_rows].clone()})
+    visible_lengths = zeros(capacity, dtype=torch.int32)
+    ratio = state["role"]["ratio"]
+    visible_lengths[:query_rows] = ((q_positions[:query_rows] + 1) // ratio).int()
     return dict(selected=selected, lengths=lengths, compressed=compressed_indices,
-                window=window_indices, scores=candidate_scores)
+                window=window_indices, scores=candidate_scores, visible_lengths=visible_lengths)

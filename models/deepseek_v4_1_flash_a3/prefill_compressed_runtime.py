@@ -214,9 +214,11 @@ def run_compressed_attention(state, full_norm, q_input, latent, query, cosine, s
     execute("shared_index_publish", rank, case, [selected, lengths, after["topk_indices"], after["topk_lengths"], query_rows],
             dict(indices=after["topk_indices"], lengths=after["topk_lengths"]), "index_select")
     if ratio == 1:
-        candidate_blocks = torch.full((capacity, 64), -1, dtype=torch.int32)
+        from .candidate_pool import POOL_CAPACITY
+
+        candidate_blocks = torch.full((capacity, POOL_CAPACITY), -1, dtype=torch.int32)
         candidate_counts = zeros(capacity, dtype=torch.int32)
-        execute("candidate_pool", rank, case, [candidate_scores, lengths.reshape(capacity),
+        execute("candidate_pool", rank, case, [candidate_scores, selection["visible_lengths"],
                 candidate_blocks, candidate_counts, query_rows],
                 dict(blocks=candidate_blocks, counts=candidate_counts), "candidate_pool")
         execute("candidate_publish", rank, case, [candidate_blocks, candidate_counts,

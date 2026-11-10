@@ -563,6 +563,16 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
         provider, contract["state_regions"]["path"], contract["state_regions"]["sha256"],
         contract["input_contract_sha256"],
     )
+    if inputs.get("prepare_input_stage") is True:
+        from types import SimpleNamespace
+        from .prefill_network_input import run_input_stage
+
+        embedding_output = output / "input-embedding"
+        run_input_stage(SimpleNamespace(input_contract=Path(contract["input_contract_path"]),
+            output=embedding_output, compile_only=False, devices=assigned))
+        paths = [str(embedding_output / f"rank-{rank}-backbone-input.pt") for rank in range(16)]
+        inputs = dict(inputs, product_input_paths=paths,
+            product_input_files={path: file_sha(path) for path in paths})
     hidden, premix = load_product_backbone_input(
         inputs["product_input_paths"], input_contract=inputs["input_contract"], provider=provider,
         capacity=16, expected_files=inputs["product_input_files"],

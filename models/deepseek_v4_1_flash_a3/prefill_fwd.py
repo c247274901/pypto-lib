@@ -24,7 +24,9 @@ from pathlib import Path
 def run_prefill(inputs, *, weights, cache, config, devices, output, continuation=None):
     """Execute the existing network using explicit checkpoint and cache-state providers.
 
-    ``inputs`` contains the backbone input tensors and input contract.
+    ``inputs`` accepts raw completion text, 1..2048 token IDs, or prepared
+    backbone tensors and their input contract. Automatic inputs use one DP
+    engine and chunks of up to 16 tokens; config may set chunk_size/dp_rank.
     ``cache`` supplies the canonical all-rank cache ABI, source descriptors and
     Engram contracts. No historical task release or layer receipt is required.
     ``continuation`` accepts one prepared chunk or a lazy iterable of chunks;
@@ -33,6 +35,16 @@ def run_prefill(inputs, *, weights, cache, config, devices, output, continuation
     from .runtime_config import configure_devices
 
     configure_devices(devices, world=config["topology"]["ep"])
+    if isinstance(inputs, (str, list, tuple)):
+        from .prefill_prepare import prepare_token_chunks
+
+        if continuation is not None or Path(output).exists():
+            raise ValueError("Automatic Prefill needs a new output directory and owns its continuation stream")
+        chunks = prepare_token_chunks(inputs, checkpoint=weights, cache=cache, config=config,
+            output=Path(output) / "prepared", chunk_size=config.get("chunk_size", 16), dp_rank=config.get("dp_rank", 0))
+        first = next(chunks)
+        inputs, cache, config = first["inputs"], first["cache"], first["contract"]
+        output, continuation = Path(output) / "network", chunks
     from .prefill_network_runtime import run_network_runtime
 
     overlap = set(inputs) & set(cache)
@@ -48,11 +60,34 @@ def load_configuration(path):
     """Read paths relative to a JSON configuration without importing the device runtime."""
     path = Path(path).resolve()
     settings = json.loads(path.read_text(encoding="utf-8"))
-    required = {"checkpoint", "inputs", "cache_state", "contract", "devices", "output"}
+    automatic = set(settings) & {"prompt", "token_ids"}
+    if len(automatic) > 1:
+        raise ValueError("Choose either prompt or token_ids for automatic Prefill")
+    if automatic:
+        if "inputs" in settings:
+            raise ValueError("Automatic Prefill cannot also supply prepared inputs")
+        if "prompt" in settings and (not isinstance(settings["prompt"], str) or not settings["prompt"]):
+            raise ValueError("prompt must contain raw completion text")
+        if "token_ids" in settings and (not isinstance(settings["token_ids"], list)
+                or not 1 <= len(settings["token_ids"]) <= 2048
+                or any(type(token) is not int or token < 0 for token in settings["token_ids"])):
+            raise ValueError("token_ids must contain 1..2048 nonnegative integers")
+        if settings.get("continuations"):
+            raise ValueError("Automatic Prefill owns its continuation descriptors")
+        for name, default, lower, upper in (("chunk_size", 16, 1, 16), ("dp_rank", 0, 0, 3)):
+            value = settings.get(name, default)
+            if type(value) is not int or not lower <= value <= upper:
+                raise ValueError(f"{name} must be an integer in {lower}..{upper}")
+            settings[name] = value
+    required = {"checkpoint", "cache_state", "contract", "devices", "output"}
+    if not automatic:
+        required.add("inputs")
     missing = required - settings.keys()
     if missing:
         raise ValueError("Missing Prefill configuration fields: " + ", ".join(sorted(missing)))
     for name in ("checkpoint", "inputs", "cache_state", "contract", "output"):
+        if name not in settings:
+            continue
         value = Path(settings[name])
         settings[name] = value if value.is_absolute() else (path.parent / value).resolve()
     chunks = settings.get("continuations", [])
@@ -122,7 +157,11 @@ def main():
     import torch
 
     contract = json.loads(settings["contract"].read_text(encoding="utf-8"))
-    inputs = torch.load(settings["inputs"], map_location="cpu", weights_only=True)
+    if "prompt" in settings or "token_ids" in settings:
+        inputs = settings["prompt"] if "prompt" in settings else settings["token_ids"]
+        contract = dict(contract, chunk_size=settings["chunk_size"], dp_rank=settings["dp_rank"])
+    else:
+        inputs = torch.load(settings["inputs"], map_location="cpu", weights_only=True)
     cache = torch.load(settings["cache_state"], map_location="cpu", weights_only=True)
     continuation = load_continuations(settings["continuations"]) if settings.get("continuations") else None
     run_prefill(inputs, weights=settings["checkpoint"], cache=cache, config=contract,
