@@ -18,6 +18,7 @@ M_TILE = 16
 N_TILE = 64
 K_TILE = 256
 VEC_M_TILE = 8
+FULL_K_TILE = 5120
 
 NAMESPACE = "pypto_dsv41_bf16_linear_v1"
 SCHEMA = "linear(Tensor source, Tensor weight_nk) -> Tensor"
@@ -249,9 +250,38 @@ def make_blocked_weight_pack(width, output_width):
     return pack_weight
 
 
-def make_dot(capacity, width, output_width):
+def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=1, column_stages=1):
     """Accumulate complete blocked INT8 products in INT32."""
     packed_rows = width * (output_width // N_TILE)
+
+    if full_k_reuse and width <= FULL_K_TILE:
+        row_tile = min(capacity, M_TILE)
+
+        @pl.jit.inline
+        def dot_full_k(
+            payload: pl.Tensor[[capacity, width], pl.INT8],
+            packed: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
+            accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
+            active: pl.Scalar[pl.INT32],
+        ):
+            row_blocks = (active + row_tile - 1) // row_tile
+            column_blocks = (output_width // N_TILE + column_group - 1) // column_group
+            for block in pl.spmd(row_blocks * column_blocks, name_hint="prefill_int8_dot_full_k"):
+                t0 = block // column_blocks * row_tile
+                first_nb = block % column_blocks * column_group
+                last_nb = pl.min(first_nb + column_group, output_width // N_TILE)
+                rows = pl.min(row_tile, active - t0)
+                source = pl.slice(payload, [row_tile, width], [t0, 0], valid_shape=[rows, width])
+                activation = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), row_tile, width)
+                for nb in pl.pipeline(first_nb, last_nb, stage=column_stages):
+                    n0 = nb * N_TILE
+                    packed_k0 = nb * width
+                    weight = packed[packed_k0 : packed_k0 + width, :]
+                    product = pl.matmul(activation, weight, out_dtype=pl.INT32)
+                    accumulator[t0 : t0 + row_tile, n0 : n0 + N_TILE] = product
+            return accumulator
+
+        return dot_full_k
 
     @pl.jit.inline
     def dot(
@@ -360,8 +390,12 @@ def make_ecotech_dynamic_linear(capacity, input_width, output_width, combine_sca
     """Consume prepacked INT8 weights with unchanged quantization and scaling."""
     if capacity <= 0 or capacity % 16 or input_width % 256 or output_width % 64:
         raise ValueError("Use a positive capacity/16, K/256 and N/64")
-    quantize = make_quantize(capacity, input_width)
-    dot = make_dot(capacity, input_width, output_width)
+    quantize = make_quantize(capacity, input_width, whole_row=True)
+    qb_columns = input_width == 1280 and output_width == 32768
+    dot = make_dot(
+        capacity, input_width, output_width, full_k_reuse=True,
+        column_group=26 if qb_columns else 1, column_stages=2 if qb_columns else 1,
+    )
     dequantize = make_dequantize(capacity, output_width, combine_scales=combine_scales)
 
     @pl.jit

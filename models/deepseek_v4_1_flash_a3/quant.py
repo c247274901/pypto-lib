@@ -15,6 +15,7 @@ from .operator_config import CONTRACT
 K_TILE = 256
 N_TILE = 64
 VEC_M_TILE = 8
+WHOLE_ROW_TILE = 5120
 
 INT8_AMAX_EPS = CONTRACT.int8_amax_epsilon
 
@@ -163,8 +164,42 @@ def make_decode_cast_tile(rows, width, input_dtype, output_dtype):
     raise ValueError(f"unsupported cast tile dtypes: {input_dtype} -> {output_dtype}")
 
 
-def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE):
+def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE, whole_row=False):
     """Specialize symmetric per-token INT8 quantization."""
+    if whole_row and width <= WHOLE_ROW_TILE and input_dtype != pl.FP32:
+        if width % 8:
+            raise ValueError("Whole-row quantization requires eight equal reduction segments")
+
+        @pl.jit.inline
+        def quantize_whole_row(
+            x: pl.Tensor[[capacity, width], input_dtype],
+            payload: pl.Tensor[[capacity, width], pl.INT8],
+            scales: pl.Tensor[[capacity, 8], pl.FP32],
+            active: pl.Scalar[pl.INT32],
+        ):
+            for token in pl.spmd(active, name_hint="prefill_token_quantize_whole_row"):
+                source = pl.slice(x, [1, width], [token, 0], valid_shape=[1, width])
+                value = pl.cast(source, pl.FP32)
+                segments = pl.reshape(pl.abs(value), [8, width // 8])
+                partial = pl.row_max(segments)
+                ones = pl.full([8, 8], dtype=pl.FP32, value=1.0)
+                repeated = pl.row_expand_mul(ones, partial)
+                maximum = pl.col_max(repeated)
+                scales[token : token + 1, :] = pl.mul(maximum, 1.0 / 127.0)
+                safe_maximum = pl.maximum(maximum, 1e-30)
+                numerator = pl.full([1, 8], dtype=pl.FP32, value=127.0)
+                inverse_row = pl.div(numerator, safe_maximum)
+                inverse = pl.read(inverse_row, [0, 0])
+                normalized = pl.mul(value, inverse)
+                lower_bounded = pl.maximum(normalized, -127.0)
+                bounded = pl.minimum(lower_bounded, 127.0)
+                rounded = pl.cast(bounded, pl.INT32, mode="rint")
+                exact_half = pl.cast(rounded, pl.FP16, mode="rint")
+                payload[token : token + 1, :] = pl.cast(exact_half, pl.INT8, mode="trunc")
+            return payload, scales
+
+        return quantize_whole_row
+
     width_tile = min(K_TILE, width)
     widen = make_cast_tile(rows_tile, width_tile, input_dtype, pl.FP32)
 

@@ -688,10 +688,10 @@ def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False, fus
     activation_dtype = pl.FP32 if fused_activation else pl.BF16
     activate = _make_shared_activation(capacity, intermediate, limit, fused_activation, fused_channel_dtype)
 
-    quant_x = _shared_make_quantize(capacity, hidden)
-    quant_hidden = _shared_make_quantize(capacity, intermediate, activation_dtype)
-    dot_gate_up = _shared_make_dot(capacity, hidden, gate_up_width)
-    dot_down = _shared_make_dot(capacity, intermediate, hidden)
+    quant_x = _shared_make_quantize(capacity, hidden, whole_row=True)
+    quant_hidden = _shared_make_quantize(capacity, intermediate, activation_dtype, whole_row=True)
+    dot_gate_up = _shared_make_dot(capacity, hidden, gate_up_width, full_k_reuse=True)
+    dot_down = _shared_make_dot(capacity, intermediate, hidden, full_k_reuse=True)
     channel_dtype = fused_channel_dtype if fused_activation else pl.FP32
     dequant_down = _shared_make_dequantize(capacity, hidden, channel_dtype=channel_dtype)
 

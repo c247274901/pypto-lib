@@ -3,6 +3,8 @@
 A3 Eco-Tech W8A8 operators, the original 40-layer Prefill composition and
 persistent runtime, and bounded Decode operators. See [Decode](decode.md)
 for the implemented Decode scope and remaining work.
+See [Prefill optimization migration](optimization-migration.md) for the A2-to-A3
+operator adaptations, historical measurements and current prepacked baseline.
 
 ## Development priorities
 

@@ -26,6 +26,8 @@ from .qkv_proj_rope import qkv_shape
 # tiling
 HEAD_TILE = 16
 WINDOW_TILE = 128
+FUSED_HEAD_TILE = 64
+FUSED_VALUE_TILE = 256
 
 BLOCK_SIZE = 128
 
@@ -161,12 +163,91 @@ def make_swa_leaves(capacity, cache_blocks, config):
     return publish, gather, attend
 
 
+def _make_swa_read_single_window(capacity, cache_blocks, config):
+    """Gather contiguous cache runs into L1 and reuse them for QK and PV."""
+    heads = config["num_attention_heads"]
+    head_dim = config["head_dim"]
+    width = heads * head_dim
+    cache_rows = cache_blocks * WINDOW_TILE
+    score_scale = head_dim ** -0.5
+
+    @pl.jit
+    def swa_read_single_window(
+        query: pl.Tensor[[capacity, width], pl.BF16],
+        indices: pl.Tensor[[capacity, WINDOW_TILE], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        cache: pl.Tensor[[cache_blocks, WINDOW_TILE, 1, head_dim], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        qflat = pl.reshape(query, [capacity * heads, head_dim])
+        oflat = pl.reshape(output, [capacity * heads, head_dim])
+        flat = pl.reshape(cache, [cache_rows, head_dim])
+        for block in pl.spmd(active * (heads // FUSED_HEAD_TILE), name_hint="prefill_swa_read_fused"):
+            token = block // (heads // FUSED_HEAD_TILE)
+            head = block % (heads // FUSED_HEAD_TILE) * FUSED_HEAD_TILE
+            query_row = token * heads + head
+            q = qflat[query_row:query_row + FUSED_HEAD_TILE, :]
+            kv = pl.create_l1([WINDOW_TILE, head_dim], pl.BF16)
+            run_start = pl.cast(0, pl.INDEX)
+            run_source = pl.read(indices, [token, 0])
+            previous = run_source
+            for row in pl.range(1, WINDOW_TILE + 1):
+                if row < WINDOW_TILE:
+                    current = pl.read(indices, [token, row])
+                else:
+                    current = pl.cast(-2, pl.INT32)
+                run_break = (previous >= 0 and current != previous + 1) or (previous < 0 and current >= 0)
+                if row == WINDOW_TILE or run_break:
+                    source = pl.cast(pl.max(run_source, 0), pl.INDEX)
+                    run_rows = row - run_start
+                    kv = pl.gather_row(kv, flat, [run_start, 0], [source, 0], [WINDOW_TILE, head_dim], valid_shape=[run_rows, head_dim])
+                    run_start = row
+                    run_source = current
+                previous = current
+            dot = pl.matmul(q, kv, b_trans=True, out_dtype=pl.FP32)
+            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                dot_part = pl.aiv_shard(dot)
+                lane_head = head + lane * (FUSED_HEAD_TILE // 2)
+                scores = pl.mul(dot_part, score_scale)
+                ids = pl.cast(indices[token:token + 1, :], pl.FP32)
+                valid = pl.minimum(pl.maximum(pl.add(ids, 1.0), 0.0), 1.0)
+                bias = pl.mul(pl.sub(valid, 1.0), 1e30)
+                scores = pl.col_expand_add(scores, bias)
+                local_max = pl.reshape(pl.row_max(scores), [1, FUSED_HEAD_TILE // 2])
+                sink_row = pl.reshape(sink[lane_head:lane_head + FUSED_HEAD_TILE // 2], [1, FUSED_HEAD_TILE // 2])
+                maximum = pl.maximum(local_max, sink_row)
+                sink_exp = pl.exp(pl.sub(sink_row, maximum))
+                max_column = pl.reshape(maximum, [FUSED_HEAD_TILE // 2, 1])
+                exponential = pl.exp(pl.row_expand_sub(scores, max_column))
+                probabilities = pl.col_expand_mul(exponential, valid)
+                probability_sum = pl.reshape(pl.row_sum(probabilities), [1, FUSED_HEAD_TILE // 2])
+                denominator = pl.add(sink_exp, probability_sum)
+                weights = pl.cast(probabilities, pl.BF16, mode="round")
+                full_weights = pl.aic_gather(weights)
+                denominator_column = pl.reshape(denominator, [FUSED_HEAD_TILE // 2, 1])
+            for value_column in pl.range(0, head_dim, FUSED_VALUE_TILE):
+                values = kv[:, value_column:value_column + FUSED_VALUE_TILE]
+                weighted = pl.matmul(full_weights, values, out_dtype=pl.FP32)
+                for lane_out in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    weighted_part = pl.aiv_shard(weighted)
+                    result = pl.row_expand_div(weighted_part, denominator_column)
+                    output_row = query_row + lane_out * (FUSED_HEAD_TILE // 2)
+                    narrowed = pl.cast(result, pl.BF16, mode="rint")
+                    oflat[output_row:output_row + FUSED_HEAD_TILE // 2, value_column:value_column + FUSED_VALUE_TILE] = narrowed
+        return output
+
+    return swa_read_single_window
+
+
 def make_swa_read(capacity, cache_blocks, config):
     """Read a published cache with an independent CP query row count."""
     heads = config["num_attention_heads"]
     head_dim = config["head_dim"]
     width = heads * head_dim
     window = config["sliding_window"]
+    if window == WINDOW_TILE and heads % FUSED_HEAD_TILE == 0 and head_dim % FUSED_VALUE_TILE == 0:
+        return _make_swa_read_single_window(capacity, cache_blocks, config)
     _publish, gather, attend = make_swa_leaves(capacity, cache_blocks, config)
 
     @pl.jit
@@ -192,7 +273,8 @@ def make_swa_inline(capacity, cache_blocks, config):
     head_dim = config["head_dim"]
     width = heads * head_dim
     window = config["sliding_window"]
-    publish, gather, attend = make_swa_leaves(capacity, cache_blocks, config)
+    publish, _gather, _attend = make_swa_leaves(capacity, cache_blocks, config)
+    read = pl.jit.inline(make_swa_read(capacity, cache_blocks, config)._func)
 
     @pl.jit.inline
     def swa_inline(
@@ -206,9 +288,7 @@ def make_swa_inline(capacity, cache_blocks, config):
         active: pl.Scalar[pl.INT32],
     ):
         publish(kv, slots, cache, active)
-        selected = pl.create_tensor([capacity * window, head_dim], dtype=pl.BF16)
-        gather(cache, indices, selected, active)
-        attend(query, selected, indices, sink, output, active)
+        read(query, indices, sink, cache, output, active)
         return cache, output
 
     return swa_inline

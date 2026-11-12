@@ -25,12 +25,15 @@ MIX_TILE = 8
 PROJ_T_TILE = 16
 PROJ_N_TILE = 16
 PROJ_K_TILE = 64
+MERGE_D_TILE = 5120
+POST_STREAM_TILE = 2
 
 
 def make_hc_collapse_inline(capacity, config):
     """Collapse four BF16 residual streams with FP32 premix weights."""
     hidden = config["hidden_size"]
     hc = config["hc_mult"]
+    merge_tile = MERGE_D_TILE if hidden % MERGE_D_TILE == 0 else D_TILE
 
     @pl.jit.inline
     def collapse(
@@ -40,20 +43,19 @@ def make_hc_collapse_inline(capacity, config):
         active: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(x, [capacity, hc * hidden])
-        for block in pl.spmd(active * (hidden // D_TILE), name_hint="a2_hc_collapse"):
-            token = block // (hidden // D_TILE)
-            offset = block % (hidden // D_TILE) * D_TILE
-            collapsed_tile = pl.full([1, D_TILE], dtype=pl.FP32, value=0.0)
+        for block in pl.spmd(active * (hidden // merge_tile), name_hint="a2_hc_collapse"):
+            token = block // (hidden // merge_tile)
+            offset = block % (hidden // merge_tile) * merge_tile
+            collapsed_tile = pl.full([1, merge_tile], dtype=pl.FP32, value=0.0)
             for stream in pl.unroll(hc):
                 source_offset = stream * hidden + offset
-                source_bf16 = flat[token : token + 1, source_offset : source_offset + D_TILE]
+                source_bf16 = flat[token : token + 1, source_offset : source_offset + merge_tile]
                 source_fp32 = pl.cast(source_bf16, pl.FP32)
                 coefficient = pl.read(incoming, [token, stream])
                 term = pl.mul(source_fp32, coefficient)
                 collapsed_tile = pl.add(collapsed_tile, term)
-            collapsed[token : token + 1, offset : offset + D_TILE] = pl.cast(
-                collapsed_tile, pl.BF16, mode="rint"
-            )
+            result = pl.cast(collapsed_tile, pl.BF16, mode="rint")
+            collapsed[token : token + 1, offset : offset + merge_tile] = result
         return collapsed
 
     return collapse
@@ -208,6 +210,8 @@ def make_hc_post_inline(capacity, config):
     """Build BF16 residual expansion with FP32 combination arithmetic."""
     hidden = config["hidden_size"]
     hc = config["hc_mult"]
+    merge_tile = MERGE_D_TILE if hidden % MERGE_D_TILE == 0 else D_TILE
+    stream_tile = POST_STREAM_TILE if hc % POST_STREAM_TILE == 0 else 1
 
     @pl.jit.inline
     def post(
@@ -218,26 +222,28 @@ def make_hc_post_inline(capacity, config):
         output: pl.InOut[pl.Tensor[[capacity, hc, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        flat = pl.reshape(residual, [capacity, hc * hidden])
-        output_flat = pl.reshape(output, [capacity, hc * hidden])
+        residual_rows = pl.reshape(residual, [capacity * hc, hidden])
+        output_rows = pl.reshape(output, [capacity * hc, hidden])
         comb_flat = pl.reshape(comb, [capacity, hc * hc])
-        for block in pl.spmd(active * hc * (hidden // D_TILE), name_hint="a2_hc_post"):
-            token = block // (hc * (hidden // D_TILE))
-            stream = block // (hidden // D_TILE) % hc
-            offset = block % (hidden // D_TILE) * D_TILE
-            value = pl.cast(sublayer[token : token + 1, offset : offset + D_TILE], pl.FP32)
-            coefficient = pl.read(post_mix, [token, stream])
-            merged = pl.mul(value, coefficient)
-            for source_stream in pl.unroll(hc):
-                source_offset = source_stream * hidden + offset
-                source = flat[token : token + 1, source_offset : source_offset + D_TILE]
-                source = pl.cast(source, pl.FP32)
-                coefficient = pl.read(comb_flat, [token, source_stream * hc + stream])
-                term = pl.mul(source, coefficient)
-                merged = pl.add(merged, term)
-            destination = stream * hidden + offset
-            merged_bf16 = pl.cast(merged, pl.BF16, mode="rint")
-            output_flat[token : token + 1, destination : destination + D_TILE] = merged_bf16
+        for block in pl.spmd(active * (hc // stream_tile) * (hidden // merge_tile), name_hint="a2_hc_post"):
+            token = block // ((hc // stream_tile) * (hidden // merge_tile))
+            stream_start = block // (hidden // merge_tile) % (hc // stream_tile) * stream_tile
+            offset = block % (hidden // merge_tile) * merge_tile
+            value = pl.cast(sublayer[token : token + 1, offset : offset + merge_tile], pl.FP32)
+            source_rows = residual_rows[token * hc : token * hc + hc, offset : offset + merge_tile]
+            source_values = pl.cast(source_rows, pl.FP32)
+            for stream_lane in pl.unroll(stream_tile):
+                stream = stream_start + stream_lane
+                coefficient = pl.read(post_mix, [token, stream])
+                merged = pl.mul(value, coefficient)
+                for source_stream in pl.unroll(hc):
+                    source = source_values[source_stream : source_stream + 1, :]
+                    coefficient = pl.read(comb_flat, [token, source_stream * hc + stream])
+                    term = pl.mul(source, coefficient)
+                    merged = pl.add(merged, term)
+                destination = token * hc + stream
+                merged_bf16 = pl.cast(merged, pl.BF16, mode="rint")
+                output_rows[destination : destination + 1, offset : offset + merge_tile] = merged_bf16
         return output
 
     return post
