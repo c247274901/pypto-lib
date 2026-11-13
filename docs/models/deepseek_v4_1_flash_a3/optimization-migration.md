@@ -2,11 +2,16 @@
 
 This migration adapts applicable optimizations from A2 revision
 `f1fc8c564f92e7705900434887d3756759daf774`. The current optimization baseline
-rebases the original migration onto consolidated A3 revision
-`9fb52df7e28adc458d63a83a0fca3215d7fdee1a`, including prepacked-weight
+rebases the original migration onto A3 revision
+`60783e6ae0da024663716ba3678ce9523c54afb9`, including consolidated revision
+`9fb52df7e28adc458d63a83a0fca3215d7fdee1a`, prepacked-weight
 revision `21cac9478f4b02048af1de4c4c91787c5e9ebe05` and its packed-loader
 Torch reference fixes. Prefill is the first optimization target; Decode
 tuning follows separately.
+
+The latest upstream fixes accept tuple Engram layer identifiers and remove
+obsolete Indexer tensor-collector access. The migrated optimization patch is
+unchanged by this rebase; no new device accuracy or latency results are claimed.
 
 ## Current prepacked baseline
 
@@ -28,7 +33,8 @@ that included per-call weight packing cannot serve as the new baseline.
 Other measurements can be reused only after verifying the same input,
 implementation, environment and measurement boundary.
 
-The rebased tree passed compile-only checks with PTOAS 0.72 for the actual
+Before the latest upstream fixes, the prepacked baseline passed compile-only
+checks with PTOAS 0.72 for the actual
 TP4 QKV composition, fused 128-window SWA, HC, prepacked shared FP32-channel
 and routed FP16-channel experts, and the K=8192 blocked fallback. These six
 checks generate code without executing device kernels. Device accuracy and
