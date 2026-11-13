@@ -164,11 +164,38 @@ def make_decode_cast_tile(rows, width, input_dtype, output_dtype):
     raise ValueError(f"unsupported cast tile dtypes: {input_dtype} -> {output_dtype}")
 
 
+def make_quantize_row(width):
+    """Quantize one FP32 row with eight-segment maximum reduction."""
+    @pl.jit.inline
+    def quantize_row(value: pl.Tensor[[1, width], pl.FP32]):
+        segments = pl.reshape(pl.abs(value), [8, width // 8])
+        partial = pl.row_max(segments)
+        ones = pl.full([8, 8], dtype=pl.FP32, value=1.0)
+        repeated = pl.row_expand_mul(ones, partial)
+        maximum = pl.col_max(repeated)
+        scale = pl.mul(maximum, 1.0 / 127.0)
+        safe_maximum = pl.maximum(maximum, 1e-30)
+        numerator = pl.full([1, 8], dtype=pl.FP32, value=127.0)
+        inverse_row = pl.div(numerator, safe_maximum)
+        inverse = pl.read(inverse_row, [0, 0])
+        normalized = pl.mul(value, inverse)
+        lower_bounded = pl.maximum(normalized, -127.0)
+        bounded = pl.minimum(lower_bounded, 127.0)
+        rounded = pl.cast(bounded, pl.INT32, mode="rint")
+        exact_half = pl.cast(rounded, pl.FP16, mode="rint")
+        codes = pl.cast(exact_half, pl.INT8, mode="trunc")
+        return codes, scale
+
+    return quantize_row
+
+
 def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE, whole_row=False):
     """Specialize symmetric per-token INT8 quantization."""
-    if whole_row and width <= WHOLE_ROW_TILE and input_dtype != pl.FP32:
+    if whole_row and width <= WHOLE_ROW_TILE:
         if width % 8:
             raise ValueError("Whole-row quantization requires eight equal reduction segments")
+        widen_row = make_cast_tile(1, width, input_dtype, pl.FP32)
+        quantize_row = make_quantize_row(width)
 
         @pl.jit.inline
         def quantize_whole_row(
@@ -179,23 +206,11 @@ def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE,
         ):
             for token in pl.spmd(active, name_hint="prefill_token_quantize_whole_row"):
                 source = pl.slice(x, [1, width], [token, 0], valid_shape=[1, width])
-                value = pl.cast(source, pl.FP32)
-                segments = pl.reshape(pl.abs(value), [8, width // 8])
-                partial = pl.row_max(segments)
-                ones = pl.full([8, 8], dtype=pl.FP32, value=1.0)
-                repeated = pl.row_expand_mul(ones, partial)
-                maximum = pl.col_max(repeated)
-                scales[token : token + 1, :] = pl.mul(maximum, 1.0 / 127.0)
-                safe_maximum = pl.maximum(maximum, 1e-30)
-                numerator = pl.full([1, 8], dtype=pl.FP32, value=127.0)
-                inverse_row = pl.div(numerator, safe_maximum)
-                inverse = pl.read(inverse_row, [0, 0])
-                normalized = pl.mul(value, inverse)
-                lower_bounded = pl.maximum(normalized, -127.0)
-                bounded = pl.minimum(lower_bounded, 127.0)
-                rounded = pl.cast(bounded, pl.INT32, mode="rint")
-                exact_half = pl.cast(rounded, pl.FP16, mode="rint")
-                payload[token : token + 1, :] = pl.cast(exact_half, pl.INT8, mode="trunc")
+                value = pl.create_tensor([1, width], dtype=pl.FP32)
+                value[:, :] = widen_row(source)
+                codes, scale = quantize_row(value)
+                scales[token : token + 1, :] = scale
+                payload[token : token + 1, :] = codes
             return payload, scales
 
         return quantize_whole_row
@@ -335,8 +350,11 @@ def make_decode_quantize(capacity, width, input_dtype=pl.BF16):
 
 def make_dequantize(capacity, output_width, combine_scales=False, channel_dtype=pl.FP32):
     """Apply channel-first or combined scales with the selected channel rounding."""
-    narrow_channel = make_cast_tile(VEC_M_TILE, N_TILE, pl.FP32, channel_dtype)
-    widen_channel = make_cast_tile(VEC_M_TILE, N_TILE, channel_dtype, pl.FP32)
+    column_tile = 1280 if output_width == 5120 else 1024
+    while column_tile > N_TILE and output_width % column_tile:
+        column_tile //= 2
+    narrow_channel = make_cast_tile(VEC_M_TILE, column_tile, pl.FP32, channel_dtype)
+    widen_channel = make_cast_tile(VEC_M_TILE, column_tile, channel_dtype, pl.FP32)
 
     @pl.jit.inline
     def dequantize(
@@ -347,28 +365,28 @@ def make_dequantize(capacity, output_width, combine_scales=False, channel_dtype=
         active: pl.Scalar[pl.INT32],
     ):
         row_blocks = (active + VEC_M_TILE - 1) // VEC_M_TILE
-        for block in pl.spmd(row_blocks * (output_width // N_TILE), name_hint="a2_dequantize"):
-            t0 = (block // (output_width // N_TILE)) * VEC_M_TILE
-            n0 = (block % (output_width // N_TILE)) * N_TILE
+        for block in pl.spmd(row_blocks * (output_width // column_tile), name_hint="a2_dequantize"):
+            t0 = (block // (output_width // column_tile)) * VEC_M_TILE
+            n0 = (block % (output_width // column_tile)) * column_tile
             rows = pl.min(VEC_M_TILE, active - t0)
-            integer = accumulator[t0 : t0 + VEC_M_TILE, n0 : n0 + N_TILE]
+            integer = accumulator[t0 : t0 + VEC_M_TILE, n0 : n0 + column_tile]
             value = pl.cast(integer, pl.FP32, mode="rint")
-            channels = pl.reshape(channel_scale[n0 : n0 + N_TILE], [1, N_TILE])
+            channels = pl.reshape(channel_scale[n0 : n0 + column_tile], [1, column_tile])
             scale = pl.row_min(token_scale[t0 : t0 + VEC_M_TILE, :])
             if combine_scales:
-                ones = pl.full([VEC_M_TILE, N_TILE], dtype=pl.FP32, value=1.0)
+                ones = pl.full([VEC_M_TILE, column_tile], dtype=pl.FP32, value=1.0)
                 channel_rows = pl.col_expand_mul(ones, channels)
                 combined = pl.row_expand_mul(channel_rows, scale)
                 scaled = pl.mul(value, combined)
             else:
-                scaled_channels = pl.create_tensor([VEC_M_TILE, N_TILE], dtype=pl.FP32)
+                scaled_channels = pl.create_tensor([VEC_M_TILE, column_tile], dtype=pl.FP32)
                 scaled_channels[:, :] = pl.col_expand_mul(value, channels)
-                rounded_channels = pl.create_tensor([VEC_M_TILE, N_TILE], dtype=channel_dtype)
+                rounded_channels = pl.create_tensor([VEC_M_TILE, column_tile], dtype=channel_dtype)
                 rounded_channels[:, :] = narrow_channel(scaled_channels)
                 channel_fp32 = widen_channel(rounded_channels)
                 scaled = pl.row_expand_mul(channel_fp32, scale)
             narrowed = pl.cast(scaled, pl.BF16, mode="rint")
-            output[t0 : t0 + VEC_M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(narrowed, rows, N_TILE)
+            output[t0 : t0 + VEC_M_TILE, n0 : n0 + column_tile] = pl.set_validshape(narrowed, rows, column_tile)
         return output
 
     return dequantize

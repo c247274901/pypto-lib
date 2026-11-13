@@ -5,6 +5,8 @@ persistent runtime, and bounded Decode operators. See [Decode](decode.md)
 for the implemented Decode scope and remaining work.
 See [Prefill optimization migration](optimization-migration.md) for the A2-to-A3
 operator adaptations, historical measurements and current prepacked baseline.
+See [Prefill operator results](prefill-operator-results.md) for the combined
+operator changes, accuracy coverage and measurements against the original A3.
 
 ## Development priorities
 
@@ -36,8 +38,7 @@ operator adaptations, historical measurements and current prepacked baseline.
 | Host Engram tables and row preparation | `engram_host.py` |
 | Device Engram projection and gating | `engram.py`, `prefill_network_engram.py` |
 
-The package has 45 Python modules. The
-[ownership map](../../../models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md)
+The [ownership map](../../../models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md)
 describes shared primitives and phase-specific numerical variants.
 Historical audits, independent-layer runners, reference-capture workers,
 state replay, tensor collectors and identity-lock manifests are removed.

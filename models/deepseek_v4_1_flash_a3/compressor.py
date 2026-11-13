@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compressor projections, ratio pooling and cache publication."""
 
+from math import gcd
+
 import pypto.language as pl
 from .config import FLASH as M
 from .gemm import VEC_M_TILE
@@ -286,13 +288,14 @@ def make_index_cache_publish_observed(capacity, blocks, page_rows=64):
         scale_values = pl.reshape(row_scales, [1, capacity * 8])
         with pl.spmd(1, name_hint="index_fused_publication"):
             _writer = pl.tile.get_block_idx()
+            staged_payload = payload[:, :]
             narrowed_scales = pl.cast(scale_values[:, :], pl.FP16, mode="rint")
             for token in pl.range(active):
                 block = pl.read(slots, [token, 0])
                 offset = pl.read(slots, [token, 1])
                 if block >= 0 and offset >= 0:
                     row = pl.cast(block * page_rows + offset, pl.INDEX)
-                    flat_cache[row : row + 1, :] = payload[token : token + 1, :]
+                    flat_cache[row : row + 1, :] = staged_payload[token : token + 1, :]
                     publication_scale = pl.read(narrowed_scales, [0, token * 8])
                     pl.write(flat_scales, [row, 0], publication_scale)
         return cache, scales, payload, row_scales
@@ -347,11 +350,74 @@ def make_decode_indexer_cache_publish(capacity, blocks, width):
 
 COMPRESSOR_PROJECTION_HEAD_DIM = 512
 INDEX_WIDTH = 128
+PROJECTION_ROWS_DYN = pl.dynamic("V41_PROJECTION_ROWS_DYN")
+
+
+def _make_fp32_projection_tile(width, output_width):
+    """Accumulate one K partition of a BF16 projection into FP32 scratch."""
+    m_tile, n_tile = 16, min(256, output_width)
+    partition_width = gcd(1024, width)
+    partitions = width // partition_width
+    k_tile = gcd(256, partition_width)
+
+    @pl.jit.inline
+    def project_tile(
+        source: pl.Tensor[[T_DYN, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.BF16],
+        output: pl.Tensor[[PROJECTION_ROWS_DYN, output_width], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+        block: pl.Scalar[pl.INT32],
+    ):
+        partition = block % partitions
+        slab = block // partitions
+        row = slab // (output_width // n_tile) * m_tile
+        col = slab % (output_width // n_tile) * n_tile
+        rows = pl.min(m_tile, active - row)
+        acc = pl.create_tensor([m_tile, n_tile], dtype=pl.FP32)
+        for step in pl.pipeline(0, partition_width, k_tile, stage=2):
+            k0 = partition * partition_width + step
+            a = pl.slice(source, [m_tile, k_tile], [row, k0], valid_shape=[rows, k_tile])
+            b = pl.slice(weight, [k_tile, n_tile], [k0, col])
+            acc = pl.matmul_acc(acc, a, b, init_cond=(step == 0))
+        output_row = partition * pl.tensor.dim(source, 0) + row
+        output[output_row : output_row + m_tile, col : col + n_tile] = pl.set_validshape(acc, rows, n_tile)
+        return output
+
+    return project_tile
+
+
+def _make_fp32_projection_reduce(width, output_width):
+    """Reduce FP32 projection partitions in order across each active output row."""
+    partitions = width // gcd(1024, width)
+    rows_tile = 8
+
+    @pl.jit.inline
+    def reduce_projection(
+        partials: pl.Tensor[[PROJECTION_ROWS_DYN, output_width], pl.FP32],
+        output: pl.Tensor[[T_DYN, output_width], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+        block: pl.Scalar[pl.INT32],
+    ):
+        tokens = pl.tensor.dim(output, 0)
+        row = block * rows_tile
+        rows = pl.min(rows_tile, active - row)
+        total = pl.slice(partials, [rows_tile, output_width], [row, 0], valid_shape=[rows, output_width])
+        for partition in pl.range(1, partitions):
+            partial_row = partition * tokens + row
+            part = pl.slice(partials, [rows_tile, output_width], [partial_row, 0], valid_shape=[rows, output_width])
+            total = pl.add(total, part)
+        output[row : row + rows_tile, :] = pl.set_validshape(total, rows, output_width)
+        return output
+
+    return reduce_projection
 
 
 def make_fp32_projection(width, output_width):
-    """Project widened BF16 storage with FP32 operands and accumulation."""
-    m_tile, k_tile, n_tile = 16, 256, min(64, output_width)
+    """Project BF16 operands with FP32 accumulation and output."""
+    m_tile, n_tile = 16, min(256, output_width)
+    partitions = width // gcd(1024, width)
+    project_tile = _make_fp32_projection_tile(width, output_width)
+    reduce_projection = _make_fp32_projection_reduce(width, output_width)
 
     @pl.jit.inline
     def project(
@@ -360,21 +426,15 @@ def make_fp32_projection(width, output_width):
         output: pl.Tensor[[T_DYN, output_width], pl.FP32],
         active: pl.Scalar[pl.INT32],
     ):
-        blocks = (active + m_tile - 1) // m_tile * (output_width // n_tile)
-        with pl.spmd(blocks, name_hint="a2_fp32_projection") as projection_tid:
+        partial_rows = partitions * pl.tensor.dim(source, 0)
+        partials = pl.create_tensor([partial_rows, output_width], dtype=pl.FP32)
+        blocks = (active + m_tile - 1) // m_tile * (output_width // n_tile) * partitions
+        with pl.spmd(blocks, name_hint="a2_fp32_projection_partial", allow_early_resolve=True) as partial_tid:
             block = pl.tile.get_block_idx()
-            row = block // (output_width // n_tile) * m_tile
-            col = block % (output_width // n_tile) * n_tile
-            rows = pl.min(m_tile, active - row)
-            acc = pl.create_tensor([m_tile, n_tile], dtype=pl.FP32)
-            for k0 in pl.range(0, width, k_tile):
-                a = pl.slice(source, [m_tile, k_tile], [row, k0], valid_shape=[rows, k_tile])
-                a = pl.set_validshape(pl.fillpad(a, pad_value=pl.PadValue.zero), m_tile, k_tile)
-                a = pl.cast(a, pl.FP32)
-                b = pl.slice(weight, [k_tile, n_tile], [k0, col])
-                b = pl.cast(b, pl.FP32)
-                acc = pl.matmul_acc(acc, a, b, init_cond=(k0 == 0))
-            output[row : row + m_tile, col : col + n_tile] = pl.set_validshape(acc, rows, n_tile)
+            project_tile(source, weight, partials, active, block)
+        with pl.spmd((active + 7) // 8, name_hint="a2_fp32_projection_reduce", deps=[partial_tid], allow_early_resolve=True) as projection_tid:
+            block = pl.tile.get_block_idx()
+            reduce_projection(partials, output, active, block)
         return projection_tid
 
     return project
@@ -709,7 +769,10 @@ def make_layer2_c1c2(capacity, config):
 
 def make_c2_projection(capacity, hidden):
     """Expose both full-width FP32 compressor projections from BF16 checkpoint operands."""
-    project = make_fp32_projection(hidden, COMPRESSOR_PROJECTION_HEAD_DIM)
+    project_tile = _make_fp32_projection_tile(hidden, COMPRESSOR_PROJECTION_HEAD_DIM)
+    reduce_projection = _make_fp32_projection_reduce(hidden, COMPRESSOR_PROJECTION_HEAD_DIM)
+    partitions = hidden // gcd(1024, hidden)
+    partial_rows = partitions * capacity
 
     @pl.jit
     def c2_projection(
@@ -720,8 +783,23 @@ def make_c2_projection(capacity, hidden):
         gate: pl.InOut[pl.Tensor[[capacity, COMPRESSOR_PROJECTION_HEAD_DIM], pl.FP32]],
         active: pl.Scalar[pl.INT32],
     ):
-        project(x, wkv, kv, active)
-        project(x, wgate, gate, active)
+        kv_partials = pl.create_tensor([partial_rows, COMPRESSOR_PROJECTION_HEAD_DIM], dtype=pl.FP32)
+        gate_partials = pl.create_tensor([partial_rows, COMPRESSOR_PROJECTION_HEAD_DIM], dtype=pl.FP32)
+        blocks = (active + 15) // 16 * (COMPRESSOR_PROJECTION_HEAD_DIM // 256) * partitions
+        with pl.spmd(2 * blocks, name_hint="c2_paired_projection_partial", allow_early_resolve=True) as partial_tid:
+            block = pl.tile.get_block_idx()
+            projection_block = block // 2
+            if block % 2 == 0:
+                project_tile(x, wkv, kv_partials, active, projection_block)
+            else:
+                project_tile(x, wgate, gate_partials, active, projection_block)
+        with pl.spmd(2 * ((active + 7) // 8), name_hint="c2_paired_projection_reduce", deps=[partial_tid], allow_early_resolve=True):
+            block = pl.tile.get_block_idx()
+            row_block = block // 2
+            if block % 2 == 0:
+                reduce_projection(kv_partials, kv, active, row_block)
+            else:
+                reduce_projection(gate_partials, gate, active, row_block)
         return kv, gate
 
     return c2_projection
@@ -1011,7 +1089,8 @@ def pool_prefill(
     state_rows = num_state_blocks * ring_rows
     flat = pl.reshape(state_cache, [state_rows, STATE_WIDTH])
     with pl.spmd(
-        pl.max((num_tokens + T_TILE - 1) // T_TILE, 1), name_hint="c2_pool", deps=[pair_ready]
+        pl.max((num_tokens + T_TILE - 1) // T_TILE, 1), name_hint="c2_pool", deps=[pair_ready],
+        allow_early_resolve=True,
     ) as pool_tid:
         group = pl.tile.get_block_idx()
         t = group * T_TILE
@@ -1025,8 +1104,19 @@ def pool_prefill(
             current_score = pl.set_validshape(current_score, T_TILE, HEAD_DIM)
             previous_kv = pl.full([T_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
             previous_score = pl.full([T_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            if t > 0:
+                previous_kv = pl.slice(kv_proj, [T_TILE, HEAD_DIM], [t - 1, 0], valid_shape=[rows, HEAD_DIM])
+                previous_score = pl.slice(score_proj, [T_TILE, HEAD_DIM], [t - 1, 0], valid_shape=[rows, HEAD_DIM])
+            else:
+                previous_rows = pl.min(T_TILE - 1, num_tokens)
+                leading_kv = pl.slice(kv_proj, [T_TILE - 1, HEAD_DIM], [0, 0], valid_shape=[previous_rows, HEAD_DIM])
+                leading_score = pl.slice(score_proj, [T_TILE - 1, HEAD_DIM], [0, 0], valid_shape=[previous_rows, HEAD_DIM])
+                previous_kv[1:T_TILE, :] = leading_kv
+                previous_score[1:T_TILE, :] = leading_score
+            previous_kv = pl.set_validshape(previous_kv, T_TILE, HEAD_DIM)
+            previous_score = pl.set_validshape(previous_score, T_TILE, HEAD_DIM)
             parity = pl.full([T_TILE, 8], dtype=pl.FP32, value=0.0)
-            for lane in pl.unroll(T_TILE):
+            for lane in pl.range(T_TILE):
                 token = t + lane
                 if token < num_tokens:
                     request = pl.cast(pl.read(token_to_req_indices, [token]), pl.INDEX)
@@ -1037,16 +1127,13 @@ def pool_prefill(
                             end = pl.read(query_start_loc, [request + 1])
                             position = pl.read(position_ids, [token])
                             if token >= start and token < end and position >= 0 and position % 2 == 1:
-                                if token > start:
-                                    partner_kv = kv_proj[token - 1 : token, :]
-                                    partner_score = score_proj[token - 1 : token, :]
-                                else:
+                                if token == start:
                                     slot_offset = block * ring_rows + (position - 1) % ring_rows
                                     slot = pl.cast(slot_offset, pl.INDEX)
                                     partner_kv = flat[slot : slot + 1, :HEAD_DIM]
                                     partner_score = flat[slot : slot + 1, HEAD_DIM:]
-                                previous_kv[lane : lane + 1, :] = partner_kv
-                                previous_score[lane : lane + 1, :] = partner_score
+                                    previous_kv[lane : lane + 1, :] = partner_kv
+                                    previous_score[lane : lane + 1, :] = partner_score
                                 pl.write(parity, [lane, 0], 1.0)
             highest = pl.maximum(previous_score, current_score)
             previous_exp = pl.exp(pl.sub(previous_score, highest))

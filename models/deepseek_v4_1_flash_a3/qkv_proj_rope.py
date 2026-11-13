@@ -38,8 +38,8 @@ ROPE_DIM = M.qk_rope_head_dim
 M_TILE = 16
 N_TILE = 128
 K_TILE = 64
-BF16_N_TILE = 16
-BF16_K_TILE = 512
+BF16_N_TILE = 256
+BF16_K_TILE = 256
 
 
 DECODE_HEAD_DIM = M.head_dim
@@ -135,11 +135,10 @@ def make_rope(
 
 
 def make_bf16_projection_staged(width, output_width, *, capacity=None):
-    """Accumulate BF16 Cube slabs by paired output owner and narrow once.
+    """Accumulate BF16 Cube slabs and narrow through a fused Vector epilogue.
 
     The BF16 operand passes through Vector before Cube starts its result transfer
-    (hw-native-sys/pypto#2829). Store FP32 values through Vector as well: direct
-    Acc-to-GM stores were unstable in the concurrent A5 prefill workload.
+    (hw-native-sys/pypto#2829). Results pass through Vector before GM stores.
     """
     n_tile = gcd(BF16_N_TILE, output_width)
     k_tile = gcd(BF16_K_TILE, width)
@@ -157,10 +156,8 @@ def make_bf16_projection_staged(width, output_width, *, capacity=None):
         output: pl.InOut[pl.Tensor[[extent, output_width], pl.BF16]],
         num_tokens: pl.Scalar[pl.INT32],
     ):
-        tokens = pl.tensor.dim(source, 0)
         blocks = (num_tokens + M_TILE - 1) // M_TILE * (output_width // n_tile)
-        accumulation = pl.create_tensor([tokens, output_width], dtype=pl.FP32)
-        with pl.spmd(blocks, name_hint="prefill_bf16_projection_cube") as cube_tid:
+        with pl.spmd(blocks, name_hint="prefill_bf16_projection_cube"):
             block = pl.tile.get_block_idx()
             row = block // (output_width // n_tile) * M_TILE
             col = block % (output_width // n_tile) * n_tile
@@ -168,26 +165,22 @@ def make_bf16_projection_staged(width, output_width, *, capacity=None):
             owner = col // n_owner_tile
             parity = owner % 2 * shift_enabled
             phase = shift_step * ((owner // 2) % n_pairs)
-            acc = pl.create_tensor([M_TILE, n_tile], dtype=pl.FP32)
-            for step in pl.range(width // k_tile):
+            acc = pl.create_tile([M_TILE, n_tile], dtype=pl.FP32)
+            first = (parity * (width // k_tile - 1) + phase) % (width // k_tile) * k_tile
+            initial_a = pl.load(source, [row, first], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Vec)
+            initial_b = pl.load(weight, [first, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+            acc = pl.matmul_acc(acc, initial_a, initial_b, init_cond=True)
+            for step in pl.pipeline(1, width // k_tile, stage=2):
                 directed = step + parity * (width // k_tile - 1 - 2 * step)
                 physical = (directed + phase) % (width // k_tile)
                 k = physical * k_tile
-                a = pl.slice(source, [M_TILE, k_tile], [row, k], valid_shape=[rows, k_tile])
-                a = pl.cast(a, pl.FP32)
-                a = pl.cast(a, pl.BF16, mode="rint")
-                b = weight[k : k + k_tile, col : col + n_tile]
-                acc = pl.matmul_acc(acc, a, b, init_cond=(step == 0))
+                a = pl.load(source, [row, k], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
+                b = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                acc = pl.matmul_acc(acc, a, b)
             transferred = pl.mul(acc, 1.0)
             transferred = pl.set_validshape(transferred, rows, n_tile)
-            accumulation[row : row + M_TILE, col : col + n_tile] = transferred
-        for block in pl.spmd(blocks, name_hint="prefill_bf16_projection_cast", deps=[cube_tid]):
-            row = block // (output_width // n_tile) * M_TILE
-            col = block % (output_width // n_tile) * n_tile
-            rows = pl.min(M_TILE, num_tokens - row)
-            result = pl.slice(accumulation, [M_TILE, n_tile], [row, col], valid_shape=[rows, n_tile])
-            narrowed = pl.cast(result, pl.BF16, mode="rint")
-            output[row : row + M_TILE, col : col + n_tile] = narrowed
+            narrowed = pl.cast(transferred, pl.BF16, mode="rint")
+            pl.store(narrowed, [row, col], output)
         return output
 
     return project
@@ -196,6 +189,8 @@ def make_bf16_projection_staged(width, output_width, *, capacity=None):
 def make_prefill_grouped_output(tp=1):
     """Specialize grouped Wo-A for an explicit TP1/2/4 shard."""
     validate_tp(tp)
+    k_tile = 512
+    n_tile = 96
     LOCAL_H = M.num_attention_heads // tp
 
     LOCAL_O_GROUPS = M.o_groups // tp
@@ -207,6 +202,8 @@ def make_prefill_grouped_output(tp=1):
     O_LORA = M.o_lora_rank
 
     O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+    n_blocks = (O_LORA + n_tile - 1) // n_tile
+    row_blocks = LOCAL_O_GROUPS * n_blocks
 
     @pl.jit.inline
     def prefill_grouped_output(
@@ -215,36 +212,33 @@ def make_prefill_grouped_output(tp=1):
         output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
     ):
-        """Stage Wo-A values with Vector startup and FP32 Vector stores before narrowing."""
-        tokens = pl.tensor.dim(x, 0)
-        accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
-        blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
-        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cube") as cube_tid:
+        """Stage Wo-A values with Vector startup and fused BF16 Vector stores."""
+        flat_weight = pl.reshape(weight, [LOCAL_O_WIDTH, O_GROUP_IN])
+        blocks = (num_tokens + M_TILE - 1) // M_TILE * row_blocks
+        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cube", allow_early_resolve=True):
             block = pl.tile.get_block_idx()
-            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-            group = n0 // O_LORA
-            local_n = n0 % O_LORA
+            t0 = block // row_blocks * M_TILE
+            owner = block % row_blocks
+            group = owner // n_blocks
+            local_n = owner % n_blocks * n_tile
+            n0 = group * O_LORA + local_n
             rows = pl.min(M_TILE, num_tokens - t0)
-            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-            for kb in pl.range(O_GROUP_IN // K_TILE):
-                k0 = kb * K_TILE
-                a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0], valid_shape=[rows, K_TILE])
-                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
-                w = pl.reshape(
-                    weight[group : group + 1, local_n : local_n + N_TILE, k0 : k0 + K_TILE], [N_TILE, K_TILE]
-                )
-                acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
-            accumulated[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(
-                pl.mul(acc, 1.0), rows, N_TILE
-            )
-        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cast", deps=[cube_tid]):
-            block = pl.tile.get_block_idx()
-            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-            rows = pl.min(M_TILE, num_tokens - t0)
-            value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
-            output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
+            columns = pl.min(n_tile, O_LORA - local_n)
+            acc = pl.create_tile([M_TILE, n_tile], dtype=pl.FP32)
+            initial_a = pl.load(x, [t0, group * O_GROUP_IN], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Vec)
+            initial_w = pl.load(flat_weight, [n0, 0], [n_tile, k_tile], valid_shape=[columns, k_tile], target_memory=pl.Mem.Mat)
+            initial_w = pl.tile.transpose_view(initial_w)
+            acc = pl.matmul_acc(acc, initial_a, initial_w, init_cond=True)
+            for kb in pl.pipeline(1, O_GROUP_IN // k_tile, stage=4):
+                k0 = kb * k_tile
+                x_offset = group * O_GROUP_IN + k0
+                a = pl.load(x, [t0, x_offset], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
+                w = pl.load(flat_weight, [n0, k0], [n_tile, k_tile], valid_shape=[columns, k_tile], target_memory=pl.Mem.Mat)
+                w = pl.tile.transpose_view(w)
+                acc = pl.matmul_acc(acc, a, w)
+            value = pl.set_validshape(pl.mul(acc, 1.0), rows, columns)
+            narrowed = pl.cast(value, pl.BF16, mode="rint")
+            pl.store(narrowed, [t0, n0], output)
         return output
 
     return prefill_grouped_output

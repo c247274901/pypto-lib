@@ -9,6 +9,11 @@ revision `21cac9478f4b02048af1de4c4c91787c5e9ebe05` and its packed-loader
 Torch reference fixes. Prefill is the first optimization target; Decode
 tuning follows separately.
 
+For the subsequent combined operator changes and measurements with fixed
+weight preparation outside timing, see
+[Prefill operator results](prefill-operator-results.md). The measurements
+below retain their historical implementation and timing boundary.
+
 The latest upstream fixes accept tuple Engram layer identifiers and remove
 obsolete Indexer tensor-collector access. The migrated optimization patch is
 unchanged by this rebase; no new device accuracy or latency results are claimed.

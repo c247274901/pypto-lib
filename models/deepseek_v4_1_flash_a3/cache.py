@@ -392,7 +392,7 @@ def make_network_cache_publish(capacity, plane):
 
 
 def make_network_sparse_read(capacity, config, geometry):
-    """Gather distinct cache planes and call the unchanged640-row attention leaf."""
+    """Gather buffered groups from distinct cache planes and attend640 slots."""
     long, own = geometry["long"], geometry["own"]
     blocks, long_stride, own_stride = long["blocks"], long["stride"], own["stride"]
     long_offset, own_offset = long["offset"], own["offset"]
@@ -412,21 +412,24 @@ def make_network_sparse_read(capacity, config, geometry):
         active: pl.Scalar[pl.INT32],
     ):
         selected = pl.create_tensor([capacity * 640, head_dim], dtype=pl.BF16)
-        for element in pl.spmd(active * 640, name_hint="network_distinct_cache_gather"):
-            token = element // 640
-            lane = element % 640
-            index = pl.read(indices, [token, lane])
-            if index >= 0:
-                page = pl.cast(index // 128, pl.INDEX)
-                row = pl.cast(index % 128, pl.INDEX)
-                if lane < 128:
-                    column = own_offset + row * head_dim
-                    selected[element : element + 1, :] = own_raw[page : page + 1, column : column + head_dim]
-                else:
-                    column = long_offset + row * head_dim
-                    selected[element : element + 1, :] = long_raw[page : page + 1, column : column + head_dim]
-            else:
-                selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
+        for group in pl.spmd(active * 10, name_hint="network_distinct_cache_gather", allow_early_resolve=True):
+            token = group // 10
+            start = group % 10 * 64
+            group_kv = pl.full([64, head_dim], dtype=pl.BF16, value=0.0)
+            for within in pl.pipeline(64, stage=2):
+                lane = start + within
+                index = pl.read(indices, [token, lane])
+                if index >= 0:
+                    page = pl.cast(index // 128, pl.INDEX)
+                    row = pl.cast(index % 128, pl.INDEX)
+                    if lane < 128:
+                        column = own_offset + row * head_dim
+                        group_kv[within : within + 1, :] = own_raw[page : page + 1, column : column + head_dim]
+                    else:
+                        column = long_offset + row * head_dim
+                        group_kv[within : within + 1, :] = long_raw[page : page + 1, column : column + head_dim]
+            group_row = token * 640 + start
+            selected[group_row : group_row + 64, :] = group_kv
         attend(query, selected, indices, sink, output, active)
         return output
 

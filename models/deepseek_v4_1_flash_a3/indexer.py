@@ -1072,6 +1072,8 @@ def make_prefill_indexer_select(
         raise ValueError(f"A2/A3 QLI uses fixed topk={INDEX_TOPK}")
     if compress_ratio not in (1, 2):
         raise ValueError("compress_ratio must be 1 or 2")
+    KEY_ROWS_TILE = 512
+    SORT_ROWS_TILE = 512 if key_capacity == 512 else SORT_TILE
 
     @pl.jit.inline
     def select_one(
@@ -1087,46 +1089,62 @@ def make_prefill_indexer_select(
         token = pl.tile.get_block_idx()
         position = pl.read(positions, [token])
         visible = pl.min(key_capacity, pl.max(0, (position + 1) // compress_ratio))
-        for k0 in pl.range(0, key_capacity, KEY_TILE):
-            key_tile = key[k0 : k0 + KEY_TILE, :]
-            scale_tile = pl.reshape(pl.cast(key_scale[k0 : k0 + KEY_TILE], pl.FP32), [1, KEY_TILE])
-            q_tile = pl.reshape(query[token : token + 1, :, :], [heads, head_dim])
+        q_tile = pl.reshape(query[token : token + 1, :, :], [heads, head_dim])
+        q_scale_row = pl.cast(query_scale[token : token + 1, :], pl.FP32)
+        weight_row = pl.cast(weights[token : token + 1, :], pl.FP32)
+        combined = pl.mul(q_scale_row, weight_row)
+        combined_half = pl.cast(combined, pl.FP16, mode="rint")
+        weight_column = pl.reshape(pl.cast(combined_half, pl.FP32), [heads, 1])
+        for k0 in pl.range(0, key_capacity, KEY_ROWS_TILE):
+            key_tile = key[k0 : k0 + KEY_ROWS_TILE, :]
+            scale_tile = pl.reshape(pl.cast(key_scale[k0 : k0 + KEY_ROWS_TILE], pl.FP32), [1, KEY_ROWS_TILE])
             dots = pl.matmul(q_tile, key_tile, b_trans=True, out_dtype=pl.INT32)
             dots_fp32 = pl.cast(dots, pl.FP32, mode="none")
             dots_scaled = pl.mul(pl.maximum(dots_fp32, 0.0), 0.0009765625)
             dots_half = pl.cast(dots_scaled, pl.FP16, mode="rint")
-            q_scale_row = pl.cast(query_scale[token : token + 1, :], pl.FP32)
-            weight_row = pl.cast(weights[token : token + 1, :], pl.FP32)
-            combined = pl.mul(q_scale_row, weight_row)
-            combined_half = pl.cast(combined, pl.FP16, mode="rint")
-            weight_ones = pl.full([HEAD_TILE, heads], dtype=pl.FP16, value=1.0)
-            weight_matrix = pl.col_expand_mul(weight_ones, combined_half)
-            reduced = pl.matmul(weight_matrix, dots_half, out_dtype=pl.FP32)
-            reduced_vector = pl.mul(reduced, 1.0)
-            reduced_row = pl.slice(reduced_vector, [1, KEY_TILE], [0, 0])
+            weighted = pl.row_expand_mul(pl.cast(dots_half, pl.FP32), weight_column)
+            reduced_row = pl.col_sum(weighted)
             total = pl.mul(reduced_row, scale_tile)
-            scores[token : token + 1, k0 : k0 + KEY_TILE] = total
+            scores[token : token + 1, k0 : k0 + KEY_ROWS_TILE] = total
 
-        # One fixed padded row and the documented three-stage four-way merge.
-        actual_scores = pl.load(scores, [token, 0], [1, key_capacity])
-        row_raw = pl.tile.full([1, SORT_TILE], dtype=pl.FP32, value=NEGATIVE_INF)
-        row_raw = pl.tile.assemble(row_raw, actual_scores, [0, 0])
-        absolute = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
-        distance = pl.mul(pl.sub(absolute, pl.cast(visible, pl.INT32)), -1)
-        valid = pl.minimum(pl.maximum(distance, 0), 1)
-        invalid = pl.sub(pl.tile.full([1, SORT_TILE], dtype=pl.INT32, value=1), valid)
-        valid_scores = pl.mul(row_raw, pl.cast(valid, pl.FP32))
-        invalid_scores = pl.mul(pl.cast(invalid, pl.FP32), NEGATIVE_INF)
-        row = pl.add(valid_scores, invalid_scores)
-        logical_ids = pl.sub(absolute, pl.mul(pl.add(absolute, 1), invalid))
-        sort_tmp = pl.tile.create([1, 2 * SORT_TILE], dtype=pl.FP32)
-        pairs = pl.tile.sort32(row, pl.reinterpret_view(logical_ids, pl.UINT32), tmp=sort_tmp)
-        pairs = pl.tile.mrgsort(pairs, block_len=64)
-        pairs = pl.tile.mrgsort(pairs, block_len=256)
-        pairs = pl.tile.mrgsort(pairs, block_len=1024)
-        leading = pl.tile.slice(pairs, [1, 2 * topk], [0, 0])
-        selected = pl.tile.gather_mask(leading, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-        pl.store(selected, [token, 0], indices)
+        if visible <= 32:
+            short_scores = pl.load(scores, [token, 0], [1, 32])
+            short_absolute = pl.tile.arange(0, [1, 32], dtype=pl.INT32)
+            short_distance = pl.mul(pl.sub(short_absolute, pl.cast(visible, pl.INT32)), -1)
+            short_valid = pl.minimum(pl.maximum(short_distance, 0), 1)
+            short_invalid = pl.sub(pl.tile.full([1, 32], dtype=pl.INT32, value=1), short_valid)
+            short_values = pl.mul(short_scores, pl.cast(short_valid, pl.FP32))
+            short_padding = pl.mul(pl.cast(short_invalid, pl.FP32), NEGATIVE_INF)
+            short_row = pl.add(short_values, short_padding)
+            short_ids = pl.sub(short_absolute, pl.mul(pl.add(short_absolute, 1), short_invalid))
+            short_tmp = pl.tile.create([1, 64], dtype=pl.FP32)
+            short_pairs = pl.tile.sort32(short_row, pl.reinterpret_view(short_ids, pl.UINT32), tmp=short_tmp)
+            short_selected = pl.tile.gather_mask(short_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            pl.store(short_selected, [token, 0], indices)
+            short_tail = pl.tile.full([1, topk - 32], dtype=pl.INT32, value=-1)
+            pl.store(short_tail, [token, 32], indices)
+        else:
+            # Use the smallest complete four-way merge tree for this key bucket.
+            actual_scores = pl.load(scores, [token, 0], [1, key_capacity])
+            row_raw = pl.tile.full([1, SORT_ROWS_TILE], dtype=pl.FP32, value=NEGATIVE_INF)
+            row_raw = pl.tile.assemble(row_raw, actual_scores, [0, 0])
+            absolute = pl.tile.arange(0, [1, SORT_ROWS_TILE], dtype=pl.INT32)
+            distance = pl.mul(pl.sub(absolute, pl.cast(visible, pl.INT32)), -1)
+            valid = pl.minimum(pl.maximum(distance, 0), 1)
+            invalid = pl.sub(pl.tile.full([1, SORT_ROWS_TILE], dtype=pl.INT32, value=1), valid)
+            valid_scores = pl.mul(row_raw, pl.cast(valid, pl.FP32))
+            invalid_scores = pl.mul(pl.cast(invalid, pl.FP32), NEGATIVE_INF)
+            row = pl.add(valid_scores, invalid_scores)
+            logical_ids = pl.sub(absolute, pl.mul(pl.add(absolute, 1), invalid))
+            sort_tmp = pl.tile.create([1, 2 * SORT_ROWS_TILE], dtype=pl.FP32)
+            pairs = pl.tile.sort32(row, pl.reinterpret_view(logical_ids, pl.UINT32), tmp=sort_tmp)
+            pairs = pl.tile.mrgsort(pairs, block_len=64)
+            pairs = pl.tile.mrgsort(pairs, block_len=256)
+            if SORT_ROWS_TILE > 512:
+                pairs = pl.tile.mrgsort(pairs, block_len=1024)
+            leading = pl.tile.slice(pairs, [1, 2 * topk], [0, 0])
+            selected = pl.tile.gather_mask(leading, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            pl.store(selected, [token, 0], indices)
         return scores, indices
 
     @pl.jit
@@ -1141,7 +1159,7 @@ def make_prefill_indexer_select(
         indices: pl.Out[pl.Tensor[[capacity, topk], pl.INT32]],
         active: pl.Scalar[pl.INT32],
     ):
-        for _worker in pl.spmd(active, name_hint="dsv41_a2a3_qli_select"):
+        for _worker in pl.spmd(active, name_hint="dsv41_a2a3_qli_select", optimizations=[pl.cross_core_slot(slot_num=1)]):
             select_one(
                 query,
                 query_scale,
