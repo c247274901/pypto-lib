@@ -1018,63 +1018,88 @@ def pool_prefill(
         t = group * T_TILE
         if t < num_tokens:
             rows = pl.min(T_TILE, num_tokens - t)
-            current_kv = pl.slice(kv_proj, [T_TILE, HEAD_DIM], [t, 0], valid_shape=[rows, HEAD_DIM])
-            current_kv = pl.fillpad(current_kv, pad_value=pl.PadValue.zero)
-            current_kv = pl.set_validshape(current_kv, T_TILE, HEAD_DIM)
-            current_score = pl.slice(score_proj, [T_TILE, HEAD_DIM], [t, 0], valid_shape=[rows, HEAD_DIM])
-            current_score = pl.fillpad(current_score, pad_value=pl.PadValue.zero)
-            current_score = pl.set_validshape(current_score, T_TILE, HEAD_DIM)
-            previous_kv = pl.full([T_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-            previous_score = pl.full([T_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-            parity = pl.full([T_TILE, 8], dtype=pl.FP32, value=0.0)
+            any_odd = 0
             for lane in pl.unroll(T_TILE):
                 token = t + lane
                 if token < num_tokens:
-                    request = pl.cast(pl.read(token_to_req_indices, [token]), pl.INDEX)
-                    if request >= 0 and request < pl.tensor.dim(state_block_table, 0):
-                        block = pl.cast(pl.read(state_block_table, [request, 0]), pl.INDEX)
-                        if block >= 0 and block < num_state_blocks:
-                            start = pl.read(query_start_loc, [request])
-                            end = pl.read(query_start_loc, [request + 1])
-                            position = pl.read(position_ids, [token])
-                            if token >= start and token < end and position >= 0 and position % 2 == 1:
-                                if token > start:
-                                    partner_kv = kv_proj[token - 1 : token, :]
-                                    partner_score = score_proj[token - 1 : token, :]
-                                else:
-                                    slot_offset = block * ring_rows + (position - 1) % ring_rows
-                                    slot = pl.cast(slot_offset, pl.INDEX)
-                                    partner_kv = flat[slot : slot + 1, :HEAD_DIM]
-                                    partner_score = flat[slot : slot + 1, HEAD_DIM:]
-                                previous_kv[lane : lane + 1, :] = partner_kv
-                                previous_score[lane : lane + 1, :] = partner_score
-                                pl.write(parity, [lane, 0], 1.0)
-            highest = pl.maximum(previous_score, current_score)
-            previous_exp = pl.exp(pl.sub(previous_score, highest))
-            current_exp = pl.exp(pl.sub(current_score, highest))
-            denominator = pl.add(previous_exp, current_exp)
-            previous_probability = pl.div(previous_exp, denominator)
-            current_probability = pl.div(current_exp, denominator)
-            previous_weighted = pl.mul(previous_kv, previous_probability)
-            current_weighted = pl.mul(current_kv, current_probability)
-            pooled = pl.add(previous_weighted, current_weighted)
-            pooled_bf16 = pl.cast(pooled, pl.BF16, mode="rint")
-            parity_value = pl.row_sum(parity)
-            pooled_masked = pl.row_expand_mul(pl.cast(pooled_bf16, pl.FP32), parity_value)
-            pooled_output[t : t + T_TILE, :] = pl.set_validshape(
-                pl.cast(pooled_masked, pl.BF16), rows, HEAD_DIM
-            )
-            value = pl.cast(pooled_bf16, pl.FP32)
-            square = pl.mul(value, value)
-            square = pl.mul(pl.row_sum(square), 1.0 / HEAD_DIM)
-            inverse = pl.rsqrt(pl.add(square, EPS), high_precision=True)
-            normalized = pl.row_expand_mul(value, inverse)
-            gamma = pl.reshape(pl.cast(norm_weight[:], pl.FP32), [1, HEAD_DIM])
-            weighted = pl.col_expand_mul(normalized, gamma)
-            parity = pl.row_sum(parity)
-            published = pl.row_expand_mul(weighted, parity)
-            published = pl.cast(published, pl.BF16, mode="rint")
-            latent[t : t + T_TILE, :] = pl.set_validshape(published, rows, HEAD_DIM)
+                    position = pl.read(position_ids, [token])
+                    if position >= 0 and position % 2 == 1:
+                        any_odd = 1
+            if any_odd == 0:
+                empty = pl.full([T_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                empty = pl.set_validshape(empty, rows, HEAD_DIM)
+                pooled_output[t : t + T_TILE, :] = empty
+                latent[t : t + T_TILE, :] = empty
+            else:
+                previous_kv = pl.full([T_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                previous_score = pl.full([T_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                parity = pl.full([T_TILE, 8], dtype=pl.FP32, value=0.0)
+                any_ready = 0
+                for lane in pl.range(rows):
+                    token = t + lane
+                    if token < num_tokens:
+                        position = pl.read(position_ids, [token])
+                        if position >= 0 and position % 2 == 1:
+                            request = pl.cast(pl.read(token_to_req_indices, [token]), pl.INDEX)
+                            if request >= 0 and request < pl.tensor.dim(state_block_table, 0):
+                                block = pl.cast(pl.read(state_block_table, [request, 0]), pl.INDEX)
+                                if block >= 0 and block < num_state_blocks:
+                                    start = pl.read(query_start_loc, [request])
+                                    end = pl.read(query_start_loc, [request + 1])
+                                    if token >= start and token < end:
+                                        if token > start:
+                                            previous_kv = pl.gather_row(
+                                                previous_kv, kv_proj, [lane, 0], [token - 1, 0], [1, HEAD_DIM]
+                                            )
+                                            previous_score = pl.gather_row(
+                                                previous_score, score_proj, [lane, 0], [token - 1, 0], [1, HEAD_DIM]
+                                            )
+                                        else:
+                                            slot_offset = block * ring_rows + (position - 1) % ring_rows
+                                            slot = pl.cast(slot_offset, pl.INDEX)
+                                            previous_kv = pl.gather_row(
+                                                previous_kv, flat, [lane, 0], [slot, 0], [1, HEAD_DIM]
+                                            )
+                                            previous_score = pl.gather_row(
+                                                previous_score, flat, [lane, 0], [slot, HEAD_DIM], [1, HEAD_DIM]
+                                            )
+                                        pl.write(parity, [lane, 0], 1.0)
+                                        any_ready = 1
+                if any_ready == 0:
+                    empty = pl.full([T_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    empty = pl.set_validshape(empty, rows, HEAD_DIM)
+                    pooled_output[t : t + T_TILE, :] = empty
+                    latent[t : t + T_TILE, :] = empty
+                else:
+                    current_kv = pl.slice(kv_proj, [T_TILE, HEAD_DIM], [t, 0], valid_shape=[rows, HEAD_DIM])
+                    current_score = pl.slice(score_proj, [T_TILE, HEAD_DIM], [t, 0], valid_shape=[rows, HEAD_DIM])
+                    previous_kv = pl.set_validshape(previous_kv, rows, HEAD_DIM)
+                    previous_score = pl.set_validshape(previous_score, rows, HEAD_DIM)
+                    parity = pl.set_validshape(parity, rows, 8)
+                    highest = pl.maximum(previous_score, current_score)
+                    previous_exp = pl.exp(pl.sub(previous_score, highest))
+                    current_exp = pl.exp(pl.sub(current_score, highest))
+                    denominator = pl.add(previous_exp, current_exp)
+                    previous_probability = pl.div(previous_exp, denominator)
+                    current_probability = pl.div(current_exp, denominator)
+                    previous_weighted = pl.mul(previous_kv, previous_probability)
+                    current_weighted = pl.mul(current_kv, current_probability)
+                    pooled = pl.add(previous_weighted, current_weighted)
+                    pooled_bf16 = pl.cast(pooled, pl.BF16, mode="rint")
+                    parity_value = pl.row_sum(parity)
+                    value = pl.cast(pooled_bf16, pl.FP32)
+                    square = pl.mul(value, value)
+                    square = pl.mul(pl.row_sum(square), 1.0 / HEAD_DIM)
+                    inverse = pl.rsqrt(pl.add(square, EPS), high_precision=True)
+                    normalized = pl.row_expand_mul(value, inverse)
+                    gamma = pl.reshape(pl.cast(norm_weight[:], pl.FP32), [1, HEAD_DIM])
+                    weighted = pl.col_expand_mul(normalized, gamma)
+                    published = pl.row_expand_mul(weighted, parity_value)
+                    published = pl.cast(published, pl.BF16, mode="rint")
+                    latent[t : t + T_TILE, :] = pl.set_validshape(published, rows, HEAD_DIM)
+                    pooled_masked = pl.row_expand_mul(value, parity_value)
+                    pooled_observed = pl.cast(pooled_masked, pl.BF16)
+                    pooled_output[t : t + T_TILE, :] = pl.set_validshape(pooled_observed, rows, HEAD_DIM)
     return pool_tid
 
 

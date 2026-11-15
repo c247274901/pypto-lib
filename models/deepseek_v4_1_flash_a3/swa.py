@@ -26,6 +26,7 @@ from .qkv_proj_rope import qkv_shape
 # tiling
 HEAD_TILE = 16
 WINDOW_TILE = 128
+GATHER_TILE = 16
 
 BLOCK_SIZE = 128
 
@@ -66,15 +67,18 @@ def make_swa_leaves(capacity, cache_blocks, config):
         active: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(cache, [cache_rows, head_dim])
-        for block in pl.spmd(active * window, name_hint="a2_swa_gather"):
-            token = block // window
-            column = block % window
-            index = pl.read(indices, [token, column])
-            if index >= 0:
-                row = pl.cast(index, pl.INDEX)
-                selected[block : block + 1, :] = flat[row : row + 1, :]
-            else:
-                selected[block : block + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
+        for block in pl.spmd(active * (window // GATHER_TILE), name_hint="a2_swa_gather"):
+            token = block // (window // GATHER_TILE)
+            begin = block % (window // GATHER_TILE) * GATHER_TILE
+            for lane in pl.pipeline(0, GATHER_TILE, stage=4):
+                column = begin + lane
+                index = pl.read(indices, [token, column])
+                element = token * window + column
+                if index >= 0:
+                    row = pl.cast(index, pl.INDEX)
+                    selected[element : element + 1, :] = flat[row : row + 1, :]
+                else:
+                    selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
         return selected
 
     @pl.jit.inline
@@ -88,7 +92,10 @@ def make_swa_leaves(capacity, cache_blocks, config):
     ):
         qflat = pl.reshape(query, [capacity * heads, head_dim])
         oflat = pl.reshape(output, [capacity * heads, head_dim])
-        for block in pl.spmd(active * (heads // HEAD_TILE), name_hint="a2_swa_attention"):
+        for block in pl.spmd(
+            active * (heads // HEAD_TILE), name_hint="a2_swa_attention",
+            optimizations=[pl.cross_core_slot(slot_num=4, local_slot_num=2)],
+        ):
             token = block // (heads // HEAD_TILE)
             head = block % (heads // HEAD_TILE) * HEAD_TILE
             query_row = token * heads + head
@@ -98,14 +105,17 @@ def make_swa_leaves(capacity, cache_blocks, config):
             denominator = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=1.0)
             numerator = pl.full([HEAD_TILE, head_dim], dtype=pl.FP32, value=0.0)
             sparse_maximum = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=-1e30)
+            sparse_score_cache = pl.full([HEAD_TILE, 512], dtype=pl.FP32, value=0.0)
             if window == 640:
-                for sparse_part in pl.range(4):
+                for sparse_part in pl.unroll(4):
                     sparse_column = 128 + sparse_part * WINDOW_TILE
                     sparse_row = token * window + sparse_column
                     sparse_query = qflat[query_row : query_row + HEAD_TILE, :]
                     sparse_kv = selected[sparse_row : sparse_row + WINDOW_TILE, :]
                     sparse_dot = pl.matmul(sparse_query, sparse_kv, b_trans=True)
                     sparse_scores = pl.mul(sparse_dot, score_scale)
+                    score_column = sparse_part * WINDOW_TILE
+                    sparse_score_cache[:, score_column : score_column + WINDOW_TILE] = sparse_scores
                     sparse_ids = indices[token : token + 1, sparse_column : sparse_column + WINDOW_TILE]
                     sparse_ids_fp32 = pl.cast(sparse_ids, pl.FP32)
                     sparse_shifted = pl.add(sparse_ids_fp32, 1.0)
@@ -117,12 +127,20 @@ def make_swa_leaves(capacity, cache_blocks, config):
                     sparse_row_max = pl.row_max(sparse_scores)
                     sparse_local_max = pl.reshape(sparse_row_max, [1, HEAD_TILE])
                     sparse_maximum = pl.maximum(sparse_maximum, sparse_local_max)
-            for part in pl.range(window // WINDOW_TILE):
+            for part in pl.unroll(window // WINDOW_TILE):
                 cache_row = token * window + part * WINDOW_TILE
                 q = qflat[query_row : query_row + HEAD_TILE, :]
                 kv = selected[cache_row : cache_row + WINDOW_TILE, :]
-                dot = pl.matmul(q, kv, b_trans=True)
-                scores = pl.mul(dot, score_scale)
+                if window == 640:
+                    if part > 0:
+                        score_column = (part - 1) * WINDOW_TILE
+                        scores = sparse_score_cache[:, score_column : score_column + WINDOW_TILE]
+                    else:
+                        dot = pl.matmul(q, kv, b_trans=True)
+                        scores = pl.mul(dot, score_scale)
+                else:
+                    dot = pl.matmul(q, kv, b_trans=True)
+                    scores = pl.mul(dot, score_scale)
                 index_tile = indices[token : token + 1, part * WINDOW_TILE : part * WINDOW_TILE + WINDOW_TILE]
                 index_float = pl.cast(index_tile, pl.FP32)
                 shifted_index = pl.add(index_float, 1.0)

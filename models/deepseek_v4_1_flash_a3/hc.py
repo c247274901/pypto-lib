@@ -25,12 +25,17 @@ MIX_TILE = 8
 PROJ_T_TILE = 16
 PROJ_N_TILE = 16
 PROJ_K_TILE = 64
+SHARED_PROJ_K_TILE = 512
+SHARED_PREP_K_TILE = 4096
+SHARED_PREP_N_TILE = 8
+SHARED_MERGE_D_TILE = 1024
 
 
 def make_hc_collapse_inline(capacity, config):
     """Collapse four BF16 residual streams with FP32 premix weights."""
     hidden = config["hidden_size"]
     hc = config["hc_mult"]
+    merge_tile = min(SHARED_MERGE_D_TILE, hidden)
 
     @pl.jit.inline
     def collapse(
@@ -40,18 +45,18 @@ def make_hc_collapse_inline(capacity, config):
         active: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(x, [capacity, hc * hidden])
-        for block in pl.spmd(active * (hidden // D_TILE), name_hint="a2_hc_collapse"):
-            token = block // (hidden // D_TILE)
-            offset = block % (hidden // D_TILE) * D_TILE
-            collapsed_tile = pl.full([1, D_TILE], dtype=pl.FP32, value=0.0)
+        for block in pl.spmd(active * (hidden // merge_tile), name_hint="a2_hc_collapse"):
+            token = block // (hidden // merge_tile)
+            offset = block % (hidden // merge_tile) * merge_tile
+            collapsed_tile = pl.full([1, merge_tile], dtype=pl.FP32, value=0.0)
             for stream in pl.unroll(hc):
                 source_offset = stream * hidden + offset
-                source_bf16 = flat[token : token + 1, source_offset : source_offset + D_TILE]
+                source_bf16 = flat[token : token + 1, source_offset : source_offset + merge_tile]
                 source_fp32 = pl.cast(source_bf16, pl.FP32)
                 coefficient = pl.read(incoming, [token, stream])
                 term = pl.mul(source_fp32, coefficient)
                 collapsed_tile = pl.add(collapsed_tile, term)
-            collapsed[token : token + 1, offset : offset + D_TILE] = pl.cast(
+            collapsed[token : token + 1, offset : offset + merge_tile] = pl.cast(
                 collapsed_tile, pl.BF16, mode="rint"
             )
         return collapsed
@@ -68,6 +73,8 @@ def make_hc_pre_inline(capacity, config):
     iterations = config["hc_sinkhorn_iters"]
     eps = config["hc_eps"]
     norm_eps = config["rms_norm_eps"]
+    rms_rows = max(TOKEN_TILE, flat_width // D_TILE)
+    prep_elements = min(SHARED_PREP_K_TILE * SHARED_PREP_N_TILE, channels * flat_width)
     collapse = make_hc_collapse_inline(capacity, config)
 
     @pl.jit.inline
@@ -83,24 +90,46 @@ def make_hc_pre_inline(capacity, config):
         collapsed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        flat = pl.reshape(x, [capacity, flat_width])
+        flat = pl.reshape(x, [capacity * (flat_width // D_TILE), D_TILE])
+        prepared = pl.create_tensor([capacity, flat_width], dtype=pl.FP32)
+        prepared_chunks = pl.reshape(prepared, [capacity * (flat_width // D_TILE), D_TILE])
         inverse = pl.create_tensor([capacity, TOKEN_TILE], dtype=pl.FP32)
-        for block in pl.spmd((active + TOKEN_TILE - 1) // TOKEN_TILE, name_hint="a2_hc_rms"):
-            token = block * TOKEN_TILE
-            rows = pl.min(TOKEN_TILE, active - token)
-            square_sum = pl.full([1, TOKEN_TILE], dtype=pl.FP32, value=0.0)
-            for inner in pl.range(0, flat_width, D_TILE):
-                values = pl.slice(flat, [TOKEN_TILE, D_TILE], [token, inner], valid_shape=[rows, D_TILE])
-                values = pl.fillpad(values, pad_value=pl.PadValue.zero)
-                values_fp32 = pl.cast(values, pl.FP32)
-                square = pl.mul(values_fp32, values_fp32)
-                square_sum = pl.add(square_sum, pl.reshape(pl.row_sum(square), [1, TOKEN_TILE]))
-            mean = pl.mul(square_sum, 1.0 / flat_width)
+        for token in pl.spmd(active, name_hint="a2_hc_rms"):
+            chunk_start = token * (flat_width // D_TILE)
+            values = pl.load(flat, [chunk_start, 0], [rms_rows, D_TILE], valid_shape=[flat_width // D_TILE, D_TILE])
+            values = pl.fillpad(values, pad_value=pl.PadValue.zero)
+            values_fp32 = pl.cast(values, pl.FP32)
+            prepared_valid = pl.set_validshape(values_fp32, flat_width // D_TILE, D_TILE)
+            pl.store(prepared_valid, [chunk_start, 0], prepared_chunks)
+            square = pl.mul(values_fp32, values_fp32)
+            sum_tmp = pl.create_tile([rms_rows, D_TILE], dtype=pl.FP32)
+            partial_sums = pl.row_sum(square, sum_tmp)
+            square_sum = 0.0
+            for chunk in pl.range(flat_width // D_TILE):
+                partial = pl.tile.read(partial_sums, [chunk, 0])
+                square_sum = square_sum + partial
+            argument_zero = pl.tile.full([1, TOKEN_TILE], dtype=pl.FP32, value=0.0)
+            square_sum_tile = pl.add(argument_zero, square_sum)
+            mean = pl.mul(square_sum_tile, 1.0 / flat_width)
             argument = pl.add(mean, norm_eps)
-            inverse_column = pl.reshape(pl.rsqrt(argument, high_precision=True), [TOKEN_TILE, 1])
-            ones = pl.full([TOKEN_TILE, TOKEN_TILE], dtype=pl.FP32, value=1.0)
-            inverse_tile = pl.row_expand_mul(ones, inverse_column)
-            inverse[token : token + TOKEN_TILE, :] = pl.set_validshape(inverse_tile, rows, TOKEN_TILE)
+            rsqrt_tmp = pl.create_tile([1, TOKEN_TILE], dtype=pl.FP32)
+            inverse_tile = pl.tile.rsqrt(argument, rsqrt_tmp)
+            pl.store(inverse_tile, [token, 0], inverse)
+
+        rounded_function = pl.create_tensor([channels, flat_width], dtype=pl.FP32)
+        function_flat = pl.reshape(function, [1, channels * flat_width])
+        rounded_flat = pl.reshape(rounded_function, [1, channels * flat_width])
+        for block in pl.spmd(
+            (active + capacity - 1) // capacity * (channels * flat_width // prep_elements),
+            name_hint="a2_hc_weight_prepare"
+        ):
+            prep_start = block * prep_elements
+            prep_weight = function_flat[0:1, prep_start : prep_start + prep_elements]
+            prep_bits = pl.reinterpret_view(prep_weight, pl.INT32)
+            prep_units = pl.shrs(pl.add(prep_bits, 2048), 12)
+            prep_rounded_bits = pl.shls(prep_units, 12)
+            prep_result = pl.reinterpret_view(prep_rounded_bits, pl.FP32)
+            rounded_flat[0:1, prep_start : prep_start + prep_elements] = prep_result
 
         accumulated = pl.create_tensor([capacity, channels], dtype=pl.FP32)
         channel_blocks = (channels + PROJ_N_TILE - 1) // PROJ_N_TILE
@@ -112,34 +141,22 @@ def make_hc_pre_inline(capacity, config):
             rows = pl.min(PROJ_T_TILE, active - token)
             columns = pl.min(PROJ_N_TILE, channels - channel)
             acc = pl.create_tensor([PROJ_T_TILE, PROJ_N_TILE], dtype=pl.FP32)
-            for inner in pl.range(0, flat_width, PROJ_K_TILE):
+            for inner in pl.pipeline(0, flat_width, SHARED_PROJ_K_TILE, stage=2):
                 source = pl.slice(
-                    flat, [PROJ_T_TILE, PROJ_K_TILE], [token, inner], valid_shape=[rows, PROJ_K_TILE]
+                    prepared, [PROJ_T_TILE, SHARED_PROJ_K_TILE], [token, inner], valid_shape=[rows, SHARED_PROJ_K_TILE]
                 )
-                source = pl.cast(pl.fillpad(source, pad_value=pl.PadValue.zero), pl.FP32)
                 weight = pl.slice(
-                    function, [PROJ_N_TILE, PROJ_K_TILE], [channel, inner], valid_shape=[columns, PROJ_K_TILE]
+                    rounded_function, [PROJ_N_TILE, SHARED_PROJ_K_TILE], [channel, inner], valid_shape=[columns, SHARED_PROJ_K_TILE]
                 )
-                weight = pl.fillpad(weight, pad_value=pl.PadValue.zero)
-                weight_bits = pl.reinterpret_view(weight, pl.INT32)
-                rounded_units = pl.shrs(pl.add(weight_bits, 2048), 12)
-                rounded_bits = pl.shls(rounded_units, 12)
-                weight = pl.reinterpret_view(rounded_bits, pl.FP32)
                 acc = pl.matmul_acc(acc, source, weight, b_trans=True, init_cond=(inner == 0))
-            projection_tile = pl.set_validshape(pl.mul(acc, 1.0), rows, columns)
+            projection_tile = pl.set_validshape(acc, rows, columns)
             accumulated[token : token + PROJ_T_TILE, channel : channel + PROJ_N_TILE] = projection_tile
-
-        projected = pl.create_tensor([capacity, channels], dtype=pl.FP32)
-        for block in pl.spmd(active * (channels // CHANNEL_TILE), name_hint="a2_hc_projection_normalize"):
-            token = block // (channels // CHANNEL_TILE)
-            channel = block % (channels // CHANNEL_TILE) * CHANNEL_TILE
-            dot = accumulated[token : token + 1, channel : channel + CHANNEL_TILE]
-            inverse_scalar = pl.read(inverse, [token, 0])
-            normalized = pl.mul(dot, inverse_scalar)
-            projected[token : token + 1, channel : channel + CHANNEL_TILE] = normalized
 
         comb_flat = pl.reshape(comb, [capacity, hc * hc])
         for token in pl.spmd(active, name_hint="a2_hc_sinkhorn"):
+            inverse_scalar = pl.read(inverse, [token, 0])
+            projection = pl.load(accumulated, [token, 0], [1, channels])
+            projected = pl.mul(projection, inverse_scalar)
             scale0 = pl.read(scale, [0])
             scale1 = pl.read(scale, [1])
             scale2 = pl.read(scale, [2])
@@ -147,8 +164,8 @@ def make_hc_pre_inline(capacity, config):
             post_logits = pl.tile.full([1, MIX_TILE], dtype=pl.FP32, value=0.0)
             for column in pl.unroll(MIX_TILE):
                 logical = column % hc
-                pre_value = pl.read(projected, [token, logical]) * scale0 + pl.read(base, [logical])
-                post_value = pl.read(projected, [token, hc + logical]) * scale1 + pl.read(
+                pre_value = pl.tile.read(projected, [0, logical]) * scale0 + pl.read(base, [logical])
+                post_value = pl.tile.read(projected, [0, hc + logical]) * scale1 + pl.read(
                     base, [hc + logical]
                 )
                 pl.tile.write(pre_logits, [0, column], pre_value)
@@ -171,7 +188,7 @@ def make_hc_pre_inline(capacity, config):
             for row in pl.unroll(MIX_TILE):
                 for column in pl.unroll(MIX_TILE):
                     logical = 2 * hc + (row % hc) * hc + column % hc
-                    value = pl.read(projected, [token, logical]) * scale2 + pl.read(base, [logical])
+                    value = pl.tile.read(projected, [0, logical]) * scale2 + pl.read(base, [logical])
                     pl.tile.write(logits, [row, column], value)
             row_tmp = pl.create_tile([MIX_TILE, MIX_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             row_max = pl.row_max(logits, row_tmp)
@@ -208,6 +225,7 @@ def make_hc_post_inline(capacity, config):
     """Build BF16 residual expansion with FP32 combination arithmetic."""
     hidden = config["hidden_size"]
     hc = config["hc_mult"]
+    merge_tile = min(SHARED_MERGE_D_TILE, hidden)
 
     @pl.jit.inline
     def post(
@@ -218,26 +236,27 @@ def make_hc_post_inline(capacity, config):
         output: pl.InOut[pl.Tensor[[capacity, hc, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        flat = pl.reshape(residual, [capacity, hc * hidden])
-        output_flat = pl.reshape(output, [capacity, hc * hidden])
+        flat = pl.reshape(residual, [capacity * hc, hidden])
+        output_flat = pl.reshape(output, [capacity * hc, hidden])
         comb_flat = pl.reshape(comb, [capacity, hc * hc])
-        for block in pl.spmd(active * hc * (hidden // D_TILE), name_hint="a2_hc_post"):
-            token = block // (hc * (hidden // D_TILE))
-            stream = block // (hidden // D_TILE) % hc
-            offset = block % (hidden // D_TILE) * D_TILE
-            value = pl.cast(sublayer[token : token + 1, offset : offset + D_TILE], pl.FP32)
-            coefficient = pl.read(post_mix, [token, stream])
-            merged = pl.mul(value, coefficient)
-            for source_stream in pl.unroll(hc):
-                source_offset = source_stream * hidden + offset
-                source = flat[token : token + 1, source_offset : source_offset + D_TILE]
-                source = pl.cast(source, pl.FP32)
-                coefficient = pl.read(comb_flat, [token, source_stream * hc + stream])
-                term = pl.mul(source, coefficient)
-                merged = pl.add(merged, term)
-            destination = stream * hidden + offset
-            merged_bf16 = pl.cast(merged, pl.BF16, mode="rint")
-            output_flat[token : token + 1, destination : destination + D_TILE] = merged_bf16
+        for block in pl.spmd(active * (hidden // merge_tile), name_hint="a2_hc_post"):
+            token = block // (hidden // merge_tile)
+            offset = block % (hidden // merge_tile) * merge_tile
+            value_bf16 = pl.load(sublayer, [token, offset], [1, merge_tile])
+            value = pl.cast(value_bf16, pl.FP32)
+            sources = pl.load(flat, [token * hc, offset], [hc, merge_tile])
+            sources_fp32 = pl.cast(sources, pl.FP32)
+            for stream in pl.unroll(hc):
+                coefficient = pl.read(post_mix, [token, stream])
+                merged = pl.mul(value, coefficient)
+                for source_stream in pl.unroll(hc):
+                    source = pl.slice(sources_fp32, [1, merge_tile], [source_stream, 0])
+                    coefficient = pl.read(comb_flat, [token, source_stream * hc + stream])
+                    term = pl.mul(source, coefficient)
+                    merged = pl.add(merged, term)
+                destination = token * hc + stream
+                merged_bf16 = pl.cast(merged, pl.BF16, mode="rint")
+                pl.store(merged_bf16, [destination, offset], output_flat)
         return output
 
     return post
