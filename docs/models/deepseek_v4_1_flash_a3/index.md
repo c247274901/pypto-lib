@@ -134,6 +134,17 @@ The streaming-weight diagnostic alternative and task-directory compiler reuse
 manifests are removed. Runtime dtype, shape, rank, alias, write-direction,
 source-version and lifecycle checks remain in force.
 
+Communication channels retain capacity-managed HBM and pinned host scratch
+and one host execution thread per rank across exchanges. H2D, HCCL and D2H
+share the communication stream, which completes before CPU outputs are returned.
+Compute staging reuses rank-local device slots, bounded typed views and validated
+dispatch descriptors while copying fresh complete input storage on each call.
+Each exchange uploads its actual CPU packets and returns independent ordinary
+CPU tensors. Closing the runtime
+drains communication work before releasing channels and compute workers;
+failed transport cleanup, including partial channel initialization, retains
+ownership for a subsequent close attempt.
+
 ### Fixed INT8 weight layout
 
 Initialization packs QKV, Indexer query and Prefill shared/routed expert

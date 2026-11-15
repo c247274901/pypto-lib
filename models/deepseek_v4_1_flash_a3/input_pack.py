@@ -300,16 +300,14 @@ def make_head_pack(capacity, heads, head_dim, tp):
         packed: pl.InOut[pl.Tensor[[tp * capacity, local_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(tp * capacity * (local_width // D_TILE), name_hint="prefill_cp_head_pack"):
-            column = block % (local_width // D_TILE) * D_TILE
-            row = block // (local_width // D_TILE)
+        for row in pl.spmd(tp * capacity, name_hint="prefill_cp_head_pack"):
             peer = row // capacity
             token = row % capacity
-            tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
             if token < active:
-                source = peer * local_width + column
-                tile = value[token : token + 1, source : source + D_TILE]
-            packed[row : row + 1, column : column + D_TILE] = tile
+                source = peer * local_width
+                packed[row : row + 1, 0 : local_width] = value[token : token + 1, source : source + local_width]
+            else:
+                packed[row : row + 1, 0 : local_width] = pl.full([1, local_width], dtype=pl.BF16, value=0.0)
         return packed
 
     return head_pack
@@ -318,6 +316,8 @@ def make_head_pack(capacity, heads, head_dim, tp):
 def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE):
     """Compact fixed peer buckets into contiguous physical token order."""
     scalar_rows = width < 8
+    while tile < 4096 and width % (2 * tile) == 0:
+        tile *= 2
 
     @pl.jit
     def gather_unpack(
@@ -355,17 +355,15 @@ def make_sp_reduce_pack(capacity, hidden, tp):
         physical: pl.Scalar[pl.INT32],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(tp * capacity * (hidden // D_TILE), name_hint="prefill_sp_reduce_pack"):
-            row = block // (hidden // D_TILE)
-            column = block % (hidden // D_TILE) * D_TILE
+        for row in pl.spmd(tp * capacity, name_hint="prefill_sp_reduce_pack"):
             peer = row // capacity
             local = row % capacity
             source = peer * physical + local
-            tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
-            if local < physical:
-                if source < active:
-                    tile = value[source : source + 1, column : column + D_TILE]
-            packed[row : row + 1, column : column + D_TILE] = tile
+            valid = pl.min(physical, pl.max(active - peer * physical, 0))
+            if local < valid:
+                packed[row : row + 1, 0 : hidden] = value[source : source + 1, 0 : hidden]
+            else:
+                packed[row : row + 1, 0 : hidden] = pl.full([1, hidden], dtype=pl.BF16, value=0.0)
         return packed
 
     return reduce_pack
