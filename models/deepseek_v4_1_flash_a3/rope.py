@@ -139,6 +139,7 @@ def make_adjacent_rope(capacity, heads, head_dim, rope_dim):
     output_width = heads * head_dim
     nope_dim = head_dim - rope_dim
     pair_width = rope_dim // 2
+    head_tile = math.gcd(heads, 8)
 
     @pl.jit.inline
     def rope(
@@ -148,25 +149,27 @@ def make_adjacent_rope(capacity, heads, head_dim, rope_dim):
         output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(active * heads, name_hint="a2_adjacent_rope"):
-            t = block // heads
-            base = (block % heads) * head_dim
-            output[t : t + 1, base : base + nope_dim] = x[t : t + 1, base : base + nope_dim]
-            tail = pl.cast(x[t : t + 1, base + nope_dim : base + head_dim], pl.FP32)
+        x_heads = pl.reshape(x, [capacity * heads, head_dim])
+        output_heads = pl.reshape(output, [capacity * heads, head_dim])
+        for block in pl.spmd(active * (heads // head_tile), name_hint="a2_adjacent_rope"):
+            t = block // (heads // head_tile)
+            h0 = block * head_tile
+            output_heads[h0 : h0 + head_tile, :nope_dim] = x_heads[h0 : h0 + head_tile, :nope_dim]
+            tail = pl.cast(x_heads[h0 : h0 + head_tile, nope_dim:head_dim], pl.FP32)
             even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
             odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
             c = cosine[t : t + 1, :]
             s = sine[t : t + 1, :]
-            even_c = pl.mul(even, c)
-            odd_s = pl.mul(odd, s)
-            odd_c = pl.mul(odd, c)
-            even_s = pl.mul(even, s)
+            even_c = pl.col_expand_mul(even, c)
+            odd_s = pl.col_expand_mul(odd, s)
+            odd_c = pl.col_expand_mul(odd, c)
+            even_s = pl.col_expand_mul(even, s)
             real = pl.sub(even_c, odd_s)
             imag = pl.add(odd_c, even_s)
-            rotated = pl.full([1, rope_dim], dtype=pl.FP32, value=0.0)
+            rotated = pl.full([head_tile, rope_dim], dtype=pl.FP32, value=0.0)
             rotated = pl.tensor.scatter(real, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
             rotated = pl.tensor.scatter(imag, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            output[t : t + 1, base + nope_dim : base + head_dim] = pl.cast(rotated, pl.BF16, mode="rint")
+            output_heads[h0 : h0 + head_tile, nope_dim:head_dim] = pl.cast(rotated, pl.BF16, mode="rint")
         return output
 
     return rope

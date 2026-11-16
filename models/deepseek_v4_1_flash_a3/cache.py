@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 import pypto.language as pl
 import torch
-from .swa import make_swa_leaves
+from .swa import GATHER_TILE, make_swa_leaves
 from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 
 
@@ -423,6 +423,7 @@ def make_network_cache_publish(capacity, plane):
     """Publish current BF16 rows into their real page stride and payload offset."""
     blocks, stride, offset = plane["blocks"], plane["stride"], plane["offset"]
     width = plane["width"]
+    T_TILE = 4
 
     @pl.jit
     def publish(
@@ -431,20 +432,27 @@ def make_network_cache_publish(capacity, plane):
         raw: pl.InOut[pl.Tensor[[blocks, stride], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for token in pl.spmd(active, name_hint="network_cache_plane_publish"):
-            page = pl.read(slots, [token, 0])
-            row = pl.read(slots, [token, 1])
-            if page >= 0:
-                page_index = pl.cast(page, pl.INDEX)
-                column = pl.cast(offset + row * width, pl.INDEX)
-                raw[page_index : page_index + 1, column : column + width] = value[token : token + 1, :]
+        for group in pl.spmd((active + T_TILE - 1) // T_TILE, name_hint="network_cache_plane_publish"):
+            first = group * T_TILE
+            rows = pl.min(T_TILE, active - first)
+            payload = pl.slice(value, [T_TILE, width], [first, 0], valid_shape=[rows, width])
+            payload = pl.set_validshape(payload, T_TILE, width)
+            for lane in pl.unroll(T_TILE):
+                token = first + lane
+                if token < active:
+                    page = pl.read(slots, [token, 0])
+                    row = pl.read(slots, [token, 1])
+                    if page >= 0:
+                        page_index = pl.cast(page, pl.INDEX)
+                        column = pl.cast(offset + row * width, pl.INDEX)
+                        raw[page_index : page_index + 1, column : column + width] = payload[lane : lane + 1, :]
         return raw
 
     return publish
 
 
 def make_network_sparse_read(capacity, config, geometry):
-    """Gather distinct cache planes and call the unchanged640-row attention leaf."""
+    """Gather buffered groups from distinct cache planes and attend640 slots."""
     long, own = geometry["long"], geometry["own"]
     blocks, long_stride, own_stride = long["blocks"], long["stride"], own["stride"]
     long_offset, own_offset = long["offset"], own["offset"]
@@ -464,21 +472,24 @@ def make_network_sparse_read(capacity, config, geometry):
         active: pl.Scalar[pl.INT32],
     ):
         selected = pl.create_tensor([capacity * 640, head_dim], dtype=pl.BF16)
-        for element in pl.spmd(active * 640, name_hint="network_distinct_cache_gather"):
-            token = element // 640
-            lane = element % 640
-            index = pl.read(indices, [token, lane])
-            if index >= 0:
-                page = pl.cast(index // 128, pl.INDEX)
-                row = pl.cast(index % 128, pl.INDEX)
-                if lane < 128:
-                    column = own_offset + row * head_dim
-                    selected[element : element + 1, :] = own_raw[page : page + 1, column : column + head_dim]
+        for block in pl.spmd(active * (640 // GATHER_TILE), name_hint="network_distinct_cache_gather"):
+            token = block // (640 // GATHER_TILE)
+            begin = block % (640 // GATHER_TILE) * GATHER_TILE
+            for group_lane in pl.pipeline(0, GATHER_TILE, stage=4):
+                lane = begin + group_lane
+                element = token * 640 + lane
+                index = pl.read(indices, [token, lane])
+                if index >= 0:
+                    page = pl.cast(index // 128, pl.INDEX)
+                    row = pl.cast(index % 128, pl.INDEX)
+                    if lane < 128:
+                        column = own_offset + row * head_dim
+                        selected[element : element + 1, :] = own_raw[page : page + 1, column : column + head_dim]
+                    else:
+                        column = long_offset + row * head_dim
+                        selected[element : element + 1, :] = long_raw[page : page + 1, column : column + head_dim]
                 else:
-                    column = long_offset + row * head_dim
-                    selected[element : element + 1, :] = long_raw[page : page + 1, column : column + head_dim]
-            else:
-                selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
+                    selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
         attend(query, selected, indices, sink, output, active)
         return output
 

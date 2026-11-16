@@ -93,7 +93,7 @@ def make_indexer_query_quantize(capacity):
         source = pl.reshape(query, [capacity * INDEX_HEADS, INDEX_WIDTH])
         output = pl.reshape(payload, [capacity * INDEX_HEADS, INDEX_WIDTH])
         blocks = (active * INDEX_HEADS + QUANT_ROWS_TILE - 1) // QUANT_ROWS_TILE
-        with pl.spmd(blocks, name_hint="a2_index_query_quant"):
+        with pl.spmd(blocks, name_hint="a2_index_query_quant", allow_early_resolve=True):
             block = pl.tile.get_block_idx()
             row = block * QUANT_ROWS_TILE
             rows = pl.min(QUANT_ROWS_TILE, active * INDEX_HEADS - row)
@@ -116,6 +116,90 @@ def make_indexer_query_quantize(capacity):
         return payload, scales
 
     return indexer_query_quantize
+
+
+def make_indexer_query_rope(capacity):
+    """Rotate four adjacent heads together, reusing each token's tables."""
+    HEADS_TILE = 4
+
+    @pl.jit
+    def indexer_query_rope(
+        x: pl.Tensor[[capacity, 4096], pl.BF16],
+        cosine: pl.Tensor[[capacity, 32], pl.FP32],
+        sine: pl.Tensor[[capacity, 32], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, 4096], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        source = pl.reshape(x, [capacity * INDEX_HEADS, INDEX_WIDTH])
+        target = pl.reshape(output, [capacity * INDEX_HEADS, INDEX_WIDTH])
+        with pl.spmd(active * (INDEX_HEADS // HEADS_TILE), name_hint="index_query_rope_heads", allow_early_resolve=True):
+            row = pl.tile.get_block_idx() * HEADS_TILE
+            token = row // INDEX_HEADS
+            target[row:row + HEADS_TILE, :64] = source[row:row + HEADS_TILE, :64]
+            tail = pl.cast(source[row:row + HEADS_TILE, 64:128], pl.FP32)
+            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+            c = cosine[token:token + 1, :]
+            s = sine[token:token + 1, :]
+            real = pl.sub(pl.col_expand_mul(even, c), pl.col_expand_mul(odd, s))
+            imag = pl.add(pl.col_expand_mul(odd, c), pl.col_expand_mul(even, s))
+            rotated = pl.full([HEADS_TILE, 64], dtype=pl.FP32, value=0.0)
+            rotated = pl.tensor.scatter(real, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
+            rotated = pl.tensor.scatter(imag, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
+            target[row:row + HEADS_TILE, 64:128] = pl.cast(rotated, pl.BF16, mode="rint")
+        return output
+
+    return indexer_query_rope
+
+
+def make_index_query_projection(capacity):
+    """Project packed queries and apply combined scales in the same task."""
+    if capacity <= 0 or capacity % 16:
+        raise ValueError("Use a positive capacity divisible by 16")
+    quantize = make_quantize(capacity, 1280, whole_row=True)
+    QUERY_ROWS_TILE = 16
+    QUERY_COLUMNS_TILE = 64
+    QUERY_GROUP_TILE = 4
+
+    @pl.jit
+    def index_query_projection(
+        x: pl.Tensor[[capacity, 1280], pl.BF16],
+        weight: pl.Tensor[[1280 * 64, 64], pl.INT8],
+        channel_scale: pl.Tensor[[4096], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, 4096], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        payload = pl.create_tensor([capacity, 1280], dtype=pl.INT8)
+        token_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quantize(x, payload, token_scale, active)
+        row_blocks = (active + QUERY_ROWS_TILE - 1) // QUERY_ROWS_TILE
+        column_blocks = 4096 // QUERY_COLUMNS_TILE // QUERY_GROUP_TILE
+        with pl.spmd(row_blocks * column_blocks, name_hint="index_query_project_scaled", allow_early_resolve=True):
+            block = pl.tile.get_block_idx()
+            row = block // column_blocks * QUERY_ROWS_TILE
+            first_column = block % column_blocks * QUERY_GROUP_TILE
+            rows = pl.min(QUERY_ROWS_TILE, active - row)
+            source = pl.slice(payload, [QUERY_ROWS_TILE, 1280], [row, 0], valid_shape=[rows, 1280])
+            activation = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), QUERY_ROWS_TILE, 1280)
+            scale_source = pl.slice(token_scale, [QUERY_ROWS_TILE, 8], [row, 0], valid_shape=[rows, 8])
+            scale_source = pl.set_validshape(pl.fillpad(scale_source, pad_value=pl.PadValue.zero), QUERY_ROWS_TILE, 8)
+            scale = pl.row_min(scale_source)
+            for column in pl.pipeline(first_column, first_column + QUERY_GROUP_TILE, stage=2):
+                col = column * QUERY_COLUMNS_TILE
+                packed_row = column * 1280
+                packed_weight = weight[packed_row:packed_row + 1280, :]
+                product = pl.matmul(activation, packed_weight, out_dtype=pl.INT32)
+                value = pl.cast(product, pl.FP32, mode="rint")
+                channels = pl.reshape(channel_scale[col:col + QUERY_COLUMNS_TILE], [1, QUERY_COLUMNS_TILE])
+                ones = pl.full([QUERY_ROWS_TILE, QUERY_COLUMNS_TILE], dtype=pl.FP32, value=1.0)
+                channel_rows = pl.col_expand_mul(ones, channels)
+                combined = pl.row_expand_mul(channel_rows, scale)
+                scaled = pl.mul(value, combined)
+                narrowed = pl.cast(scaled, pl.BF16, mode="rint")
+                output[row:row + QUERY_ROWS_TILE, col:col + QUERY_COLUMNS_TILE] = pl.set_validshape(narrowed, rows, QUERY_COLUMNS_TILE)
+        return output
+
+    return index_query_projection
 
 
 def make_empty_selection(capacity):
@@ -223,7 +307,7 @@ def make_index_weights(capacity):
         weights: pl.InOut[pl.Tensor[[capacity, INDEX_HEADS], pl.FP16]],
         active: pl.Scalar[pl.INT32],
     ):
-        with pl.spmd((active + WEIGHT_ROWS_TILE - 1) // WEIGHT_ROWS_TILE, name_hint="index_weights_scale"):
+        with pl.spmd((active + WEIGHT_ROWS_TILE - 1) // WEIGHT_ROWS_TILE, name_hint="index_weights_scale", allow_early_resolve=True):
             row = pl.tile.get_block_idx() * WEIGHT_ROWS_TILE
             rows = pl.min(WEIGHT_ROWS_TILE, active - row)
             source = pl.slice(projected, [WEIGHT_ROWS_TILE, INDEX_HEADS], [row, 0], valid_shape=[rows, INDEX_HEADS])
@@ -234,7 +318,7 @@ def make_index_weights(capacity):
     return index_weights
 
 
-def make_index_key_gather(cache_blocks, requests, table_pages, page_rows=64):
+def make_index_key_gather(cache_blocks, requests, table_pages, page_rows=64, *, key_capacity=KEY_CAPACITY):
     """Pack one request's paged INT8/FP16 index cache into the fixed QLI arena."""
     KEY_ROWS_TILE = 32
 
@@ -243,33 +327,34 @@ def make_index_key_gather(cache_blocks, requests, table_pages, page_rows=64):
         cache: pl.Tensor[[cache_blocks, page_rows, 1, INDEX_WIDTH], pl.INT8],
         scales: pl.Tensor[[cache_blocks, page_rows, 1, 1], pl.FP16],
         table: pl.Tensor[[requests, table_pages], pl.INT32],
-        key: pl.InOut[pl.Tensor[[KEY_CAPACITY, INDEX_WIDTH], pl.INT8]],
-        key_scale: pl.InOut[pl.Tensor[[KEY_CAPACITY], pl.FP16]],
+        key: pl.InOut[pl.Tensor[[key_capacity, INDEX_WIDTH], pl.INT8]],
+        key_scale: pl.InOut[pl.Tensor[[key_capacity], pl.FP16]],
         request: pl.Scalar[pl.INT32],
         length: pl.Scalar[pl.INT32],
     ):
-        flat = pl.reshape(cache, [cache_blocks * page_rows, INDEX_WIDTH])
-        scale_flat = pl.reshape(scales, [cache_blocks * page_rows, 1])
-        with pl.spmd(KEY_CAPACITY // KEY_ROWS_TILE, name_hint="index_key_pack"):
+        flat = pl.reshape(cache, [1, cache_blocks * page_rows * INDEX_WIDTH])
+        key_output = pl.reshape(key, [1, key_capacity * INDEX_WIDTH])
+        scale_flat = pl.reshape(scales, [1, cache_blocks * page_rows])
+        scale_output = pl.reshape(key_scale, [1, key_capacity])
+        with pl.spmd(key_capacity // KEY_ROWS_TILE, name_hint="index_key_pack", allow_early_resolve=True):
             start = pl.tile.get_block_idx() * KEY_ROWS_TILE
-            zero_values = pl.full([KEY_ROWS_TILE, INDEX_WIDTH], dtype=pl.FP16, value=0.0)
-            values = pl.cast(zero_values, pl.INT8, mode="trunc")
             if start < length:
                 page = start // page_rows
                 offset = start % page_rows
                 block = pl.cast(pl.read(table, [request, page]), pl.INDEX)
                 valid = pl.min(KEY_ROWS_TILE, length - start)
-                source = pl.slice(flat, [KEY_ROWS_TILE, INDEX_WIDTH], [block * page_rows + offset, 0], valid_shape=[valid, INDEX_WIDTH])
-                values = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), KEY_ROWS_TILE, INDEX_WIDTH)
-            key[start:start + KEY_ROWS_TILE, :] = values
-        with pl.spmd(1, name_hint="index_key_scale_pack"):
-            _writer = pl.tile.get_block_idx()
-            for row in pl.range(KEY_CAPACITY):
-                scale = pl.cast(0.0, pl.FP16)
-                if row < length:
-                    block = pl.cast(pl.read(table, [request, row // page_rows]), pl.INDEX)
-                    scale = pl.read(scale_flat, [block * page_rows + row % page_rows, 0])
-                pl.write(key_scale, [row], scale)
+                source_offset = (block * page_rows + offset) * INDEX_WIDTH
+                source = pl.slice(flat, [1, KEY_ROWS_TILE * INDEX_WIDTH], [0, source_offset], valid_shape=[1, valid * INDEX_WIDTH])
+                values = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, KEY_ROWS_TILE * INDEX_WIDTH)
+                scale_source = pl.slice(scale_flat, [1, KEY_ROWS_TILE], [0, block * page_rows + offset], valid_shape=[1, valid])
+                scale_values = pl.set_validshape(pl.fillpad(scale_source, pad_value=pl.PadValue.zero), 1, KEY_ROWS_TILE)
+            else:
+                zero_values = pl.full([1, KEY_ROWS_TILE * INDEX_WIDTH], dtype=pl.FP16, value=0.0)
+                values = pl.cast(zero_values, pl.INT8, mode="trunc")
+                scale_values = pl.full([1, KEY_ROWS_TILE], dtype=pl.FP16, value=0.0)
+            output_start = start * INDEX_WIDTH
+            key_output[0:1, output_start:output_start + KEY_ROWS_TILE * INDEX_WIDTH] = values
+            scale_output[0:1, start:start + KEY_ROWS_TILE] = scale_values
         return key, key_scale
 
     return index_key_gather
@@ -317,26 +402,80 @@ def make_shared_index_publish(capacity, shared_rows=8192):
     return shared_index_publish
 
 
-def make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, compress_ratio=2):
+def make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, compress_ratio=2,
+                                      *, key_capacity=KEY_CAPACITY):
     """Build index query, quantization, paged scoring and selection publication entries."""
-    from .gemm import make_ecotech_dynamic_linear
+    from .gemm import make_bf16_linear
     from .indexer import make_prefill_indexer_select as make_indexer_select
-    from .rope import make_adjacent_rope as make_rope
-    from .qkv_proj_rope import make_bf16_projection_staged
 
     return dict(
-        index_wqb=make_ecotech_dynamic_linear(capacity, 1280, 4096, combine_scales=True),
-        index_weights_proj=make_bf16_projection_staged(5120, 32, capacity=capacity),
-        index_query_rope=pl.jit(make_rope(capacity, 32, 128, 64)._func),
+        index_wqb=make_index_query_projection(capacity),
+        index_weights_proj=make_bf16_linear(capacity, 5120, 32),
+        index_query_rope=make_indexer_query_rope(capacity),
         index_query_quant=make_indexer_query_quantize(capacity),
         index_weights_scale=make_index_weights(capacity),
-        index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages, page_rows=128 // compress_ratio),
-        index_select=make_indexer_select(capacity, KEY_CAPACITY, compress_ratio=compress_ratio),
+        index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages,
+                                              page_rows=128 // compress_ratio, key_capacity=key_capacity),
+        index_select=make_indexer_select(capacity, key_capacity, compress_ratio=compress_ratio),
         sparse_controls=make_sparse_controls(capacity, requests, table_pages, table_pages,
                                             long_page_rows=128 // compress_ratio, compress_ratio=compress_ratio,
                                             long_page_stride=128),
         shared_index_publish=make_shared_index_publish(capacity),
     )
+
+
+def make_prefill_indexer_chain(capacity, key_capacity, compress_ratio, cache_blocks, requests, table_pages):
+    """Compose the physical query entries through causal scores and Top-512."""
+    entries = make_physical_index_query_entries(
+        capacity, {}, cache_blocks, requests, table_pages, compress_ratio, key_capacity=key_capacity,
+    )
+    project_query = pl.jit.inline(entries["index_wqb"]._func)
+    project_weights = pl.jit.inline(entries["index_weights_proj"]._func)
+    rotate = pl.jit.inline(entries["index_query_rope"]._func)
+    quantize_query = pl.jit.inline(entries["index_query_quant"]._func)
+    scale_weights = pl.jit.inline(entries["index_weights_scale"]._func)
+    gather = pl.jit.inline(entries["index_key_gather"]._func)
+    select = pl.jit.inline(entries["index_select"]._func)
+    page_rows = 128 // compress_ratio
+
+    @pl.jit
+    def prefill_indexer_chain(
+        latent: pl.Tensor[[capacity, 1280], pl.BF16],
+        hidden: pl.Tensor[[capacity, 5120], pl.BF16],
+        query_weight: pl.Tensor[[1280 * 64, 64], pl.INT8],
+        channel_scale: pl.Tensor[[4096], pl.FP32],
+        head_weight: pl.Tensor[[5120, 32], pl.BF16],
+        cosine: pl.Tensor[[capacity, 32], pl.FP32],
+        sine: pl.Tensor[[capacity, 32], pl.FP32],
+        cache: pl.Tensor[[cache_blocks, page_rows, 1, 128], pl.INT8],
+        cache_scale: pl.Tensor[[cache_blocks, page_rows, 1, 1], pl.FP16],
+        table: pl.Tensor[[requests, table_pages], pl.INT32],
+        positions: pl.Tensor[[capacity], pl.INT32],
+        projected: pl.InOut[pl.Tensor[[capacity, 4096], pl.BF16]],
+        head_projected: pl.InOut[pl.Tensor[[capacity, 32], pl.BF16]],
+        rotated: pl.InOut[pl.Tensor[[capacity, 4096], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, 32, 128], pl.INT8]],
+        query_scale: pl.InOut[pl.Tensor[[capacity, 32], pl.FP16]],
+        weights: pl.InOut[pl.Tensor[[capacity, 32], pl.FP16]],
+        key: pl.InOut[pl.Tensor[[key_capacity, 128], pl.INT8]],
+        key_scale: pl.InOut[pl.Tensor[[key_capacity], pl.FP16]],
+        scores: pl.Out[pl.Tensor[[capacity, key_capacity], pl.FP32]],
+        indices: pl.Out[pl.Tensor[[capacity, 512], pl.INT32]],
+        request: pl.Scalar[pl.INT32],
+        length: pl.Scalar[pl.INT32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        project_query(latent, query_weight, channel_scale, projected, active)
+        project_weights(hidden, head_weight, head_projected, active)
+        rotate(projected, cosine, sine, rotated, active)
+        query_heads = pl.reshape(rotated, [capacity, 32, 128])
+        quantize_query(query_heads, query, query_scale, active)
+        scale_weights(head_projected, weights, active)
+        gather(cache, cache_scale, table, key, key_scale, request, length)
+        select(query, query_scale, key, key_scale, weights, positions, scores, indices, active)
+        return projected, head_projected, rotated, query, query_scale, weights, key, key_scale, scores, indices
+
+    return prefill_indexer_chain
 
 
 def golden_index_key_gather(args):

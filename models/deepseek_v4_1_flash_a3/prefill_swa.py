@@ -83,7 +83,7 @@ def make_builders(capacity=16, config=None, cache_blocks=2, *, tp=1):
         cache_publish=standalone(publish),
         swa_read=make_swa_read(capacity, cache_blocks, config),
         swa=standalone(make_swa_inline(capacity, cache_blocks, config)),
-        inverse_rope=standalone(shared.make_rope(64, inverse=True, head_dim=512, rope_dim=64)),
+        inverse_rope=standalone(shared.make_rope(64, inverse=True, head_dim=512, rope_dim=64, max_workers=64)),
         grouped_wo_a=standalone(grouped_output),
         wo_b=shared.make_bf16_projection_staged(8192 // tp, 5120, capacity=capacity),
     )
